@@ -1113,7 +1113,7 @@ class NestingAlgorithm:
         start_time = time.time()
 
         optimizer = PairingOptimizer(self.parts, margin=self.safety_margin, angle_step=15)
-        self.parts = optimizer.find_best_pairs(threshold=0.05)
+        self.parts = optimizer.find_best_pairs(threshold=0.55)
         self.nfp_calculator = NFPCalculator(self.parts, angle_step=15, margin=self.safety_margin)
         print("ステップ0: NFPの事前計算...")
         self.nfp_calculator.precompute_nfps()
