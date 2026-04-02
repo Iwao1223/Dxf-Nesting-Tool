@@ -959,115 +959,111 @@ def calculate_nfp_task(task, parts_dict):
 
 
 class PairingOptimizer:
-    """事前合体（ペアリング）を行うクラス（純粋なShapely頂点マッチング版）"""
+    """事前合体（ペアリング）を行うクラス（究極版：真の「ブロック充填効率」ベース）"""
 
-    def __init__(self, parts: List[Part], margin: float = 0.0):
+    def __init__(self, parts: List[Part], margin: float = 0.0, angle_step: int = 15):
         self.parts = parts
         self.margin = margin
+        self.angle_step = angle_step
 
-    def find_best_pairs(self, threshold: float = 0.05) -> List[Part]:
-        print("\n" + "=" * 15 + " 自動ペアリング（事前合体）を開始 " + "=" * 15)
+    def find_best_pairs(self, threshold: float = 0.55) -> List[Part]:  # 充填効率55%以上（半分以上が中身）で合格
+        from shapely.geometry import MultiPoint
+
+        print("\n" + "=" * 15 + f" 自動ペアリング（真のブロック充填効率ベース）を開始 " + "=" * 15)
         n_parts = len(self.parts)
-        if n_parts < 2:
-            return self.parts
+        if n_parts < 2: return self.parts
 
         matches = []
-        bbox_areas = {}
-        for p in self.parts:
-            minx, miny, maxx, maxy = p.get_bounds()
-            bbox_areas[p.id] = (maxx - minx) * (maxy - miny)
 
         for i in range(n_parts):
             part_a = self.parts[i]
-            # Aのポリゴンをマージン分膨らませ、カドの頂点を取得
-            a_buf = part_a.polygon.buffer(self.margin, resolution=2)
-            a_coords = []
-            if a_buf.geom_type == 'Polygon':
-                a_coords = list(a_buf.exterior.coords)
-            elif a_buf.geom_type in ['MultiPolygon', 'GeometryCollection']:
-                for geom in getattr(a_buf, 'geoms', []):
+            area_a = part_a.get_area()
+            a_coords_full = list(part_a.polygon.exterior.coords)
+
+            # 衝突判定用のマージン付きポリゴン（角を尖らせて風船化を防ぐ）
+            a_collision_buf = part_a.polygon.buffer(max(0, self.margin - 0.05), join_style=2)
+
+            # 探索レール（マージン+0.2mm外側を滑らせる）
+            rail_margin = self.margin + 0.2 if self.margin > 0 else 0.2
+            a_rail_buf = part_a.polygon.buffer(rail_margin, resolution=2, join_style=2)
+            a_rail_coords = []
+            if a_rail_buf.geom_type == 'Polygon':
+                a_rail_coords = list(a_rail_buf.exterior.coords)
+            elif a_rail_buf.geom_type in ['MultiPolygon', 'GeometryCollection']:
+                for geom in getattr(a_rail_buf, 'geoms', []):
                     if hasattr(geom, 'exterior'):
-                        a_coords.extend(list(geom.exterior.coords))
+                        a_rail_coords.extend(list(geom.exterior.coords))
 
             for j in range(i + 1, n_parts):
                 part_b = self.parts[j]
+                area_b = part_b.get_area()
+                total_area = area_a + area_b
 
-                best_reduction = -999.0
-                best_combined_poly = None
+                best_efficiency = -1.0
                 best_angle = 0
                 best_translated_b_poly = None
 
-                # 4方向チェック
-                for angle in [0, 90, 180, 270]:
+                for angle in range(0, 360, self.angle_step):
                     rotated_b = part_b.rotate_to(angle)
-                    b_coords = list(rotated_b.polygon.exterior.coords)
+                    b_coords_full = list(rotated_b.polygon.exterior.coords)
 
-                    # 頂点が多すぎる場合（翼型など）は間引いて軽量化
-                    step_a = 1 if len(a_coords) < 50 else len(a_coords) // 25
-                    step_b = 1 if len(b_coords) < 50 else len(b_coords) // 25
+                    # 頂点を適度に間引いて高速化
+                    step_a = max(1, len(a_rail_coords) // 25)
+                    step_b = max(1, len(b_coords_full) // 25)
 
-                    minx_a, miny_a, maxx_a, maxy_a = part_a.get_bounds()
-
-                    # PyClipperを使わず、AとBの頂点同士を直接くっつける（総当たりスライド）
-                    for p_a in a_coords[::step_a]:
-                        for p_b in b_coords[::step_b]:
+                    for p_a in a_rail_coords[::step_a]:
+                        for p_b in b_coords_full[::step_b]:
                             dx = p_a[0] - p_b[0]
                             dy = p_a[1] - p_b[1]
 
-                            translated_poly_b = translate(rotated_b.polygon, dx, dy)
+                            # 1. 爆速OBB計算と【充填効率】の算出
+                            translated_b_coords = [(p[0] + dx, p[1] + dy) for p in b_coords_full]
+                            combined_mp = MultiPoint(a_coords_full + translated_b_coords)
+                            comb_obb_area = combined_mp.minimum_rotated_rectangle.area
 
-                            # ▼ めり込み判定（1ミリでもめり込んでいたらNG）
-                            if part_a.polygon.buffer(self.margin - 0.05).intersects(translated_poly_b):
+                            if comb_obb_area <= 0: continue
+                            # 枠の中にどれだけギッシリ実体が詰まっているか（%）
+                            efficiency = total_area / comb_obb_area
+
+                            # 過去最高でなければ重い処理をスキップ
+                            if efficiency <= best_efficiency:
                                 continue
 
-                            # 面積計算
-                            minx_b, miny_b, maxx_b, maxy_b = translated_poly_b.bounds
-                            comb_minx = min(minx_a, minx_b)
-                            comb_miny = min(miny_a, miny_b)
-                            comb_maxx = max(maxx_a, maxx_b)
-                            comb_maxy = max(maxy_a, maxy_b)
+                            # 2. 厳密な衝突チェック（めり込み防止）
+                            translated_poly_b = translate(rotated_b.polygon, dx, dy)
+                            if a_collision_buf.intersects(translated_poly_b):
+                                continue
 
-                            comb_bbox_area = (comb_maxx - comb_minx) * (comb_maxy - comb_miny)
-                            sum_bbox_area = bbox_areas[part_a.id] + bbox_areas[part_b.id]
+                            # 最高記録更新
+                            best_efficiency = efficiency
+                            best_angle = angle
+                            best_translated_b_poly = translated_poly_b
 
-                            reduction = 1.0 - (comb_bbox_area / sum_bbox_area)
-
-                            if reduction > best_reduction:
-                                best_reduction = reduction
-                                best_angle = angle
-                                best_translated_b_poly = translated_poly_b
-
-                # 4方向試し終わった後、一番マシだった配置を検証結果として表示！
                 if best_translated_b_poly is not None:
-                    print(f"  [検証] {part_a.id} & {part_b.id} -> 最高削減率: {best_reduction * 100:.1f}%")
+                    print(f"  [検証] {part_a.id} & {part_b.id} -> ブロック充填効率: {best_efficiency * 100:.1f}%")
 
-                    # 指定した合格ライン（デフォルト5%）を超えたら重い合体処理を行う
-                    if best_reduction >= threshold:
+                    if best_efficiency >= threshold:
                         try:
-                            # 隙間の分だけ接着剤を厚く塗ってつなぎ合わせる
-                            buffer_size = (self.margin / 2.0) + 0.1
+                            # 接着剤も角を尖らせて(join_style=2)形状を維持
+                            buffer_size = (self.margin / 2.0) + 0.05
                             combined = unary_union([
-                                part_a.polygon.buffer(buffer_size),
-                                best_translated_b_poly.buffer(buffer_size)
-                            ]).buffer(-buffer_size)
+                                part_a.polygon.buffer(buffer_size, join_style=2),
+                                best_translated_b_poly.buffer(buffer_size, join_style=2)
+                            ]).buffer(-buffer_size, join_style=2)
 
-                            # バラバラなら凸包（ゴムをかける）で強制的に1つの塊にする
                             if combined.geom_type in ['MultiPolygon', 'GeometryCollection']:
                                 combined = combined.convex_hull
 
                             if combined.geom_type == 'Polygon':
                                 matches.append({
-                                    'part_a': part_a,
-                                    'part_b': part_b,
-                                    'reduction': best_reduction,
-                                    'combined_poly': combined,
-                                    'best_angle': best_angle,
-                                    'translated_b_poly': best_translated_b_poly
+                                    'part_a': part_a, 'part_b': part_b,
+                                    'reduction': best_efficiency, 'combined_poly': combined,
+                                    'best_angle': best_angle, 'translated_b_poly': best_translated_b_poly
                                 })
                         except Exception as e:
-                            print(f"  [合体エラー] {part_a.id} & {part_b.id} -> {e}")
+                            pass
 
-        # 成績順にソートして上から採用
+        # 充填効率が高い（綺麗な長方形に近い）順にソートして採用
         matches.sort(key=lambda x: x['reduction'], reverse=True)
         used_ids = set()
         new_parts = []
@@ -1075,9 +1071,7 @@ class PairingOptimizer:
         for match in matches:
             pa = match['part_a']
             pb = match['part_b']
-
-            if pa.id in used_ids or pb.id in used_ids:
-                continue
+            if pa.id in used_ids or pb.id in used_ids: continue
 
             poly = match['combined_poly'].simplify(0.01, preserve_topology=True)
             if poly.geom_type == 'Polygon':
@@ -1091,11 +1085,10 @@ class PairingOptimizer:
                 new_parts.append(new_part)
                 used_ids.add(pa.id)
                 used_ids.add(pb.id)
-                print(f"  ✨ [ペア成立] {pa.id} & {pb.id} (面積削減率: {match['reduction'] * 100:.1f}%)")
+                print(f"  ✨ [ペア成立] {pa.id} & {pb.id} (充填効率: {match['reduction'] * 100:.1f}%)")
 
         for p in self.parts:
-            if p.id not in used_ids:
-                new_parts.append(p)
+            if p.id not in used_ids: new_parts.append(p)
 
         print(f"事前合体完了: {n_parts}個 -> {len(new_parts)}個のブロックに集約されました。")
         print("=" * 40 + "\n")
@@ -1119,11 +1112,9 @@ class NestingAlgorithm:
         """複数の探索戦略を並列実行し、最良の結果を返す"""
         start_time = time.time()
 
-        optimizer = PairingOptimizer(self.parts, margin=self.safety_margin)
-        self.parts = optimizer.find_best_pairs(threshold=0.01)  # 15%削減を合格ラインに設定
-
-        nfp_calculator = NFPCalculator(self.parts, angle_step=15, margin=self.safety_margin)
-        self.nfp_calculator = nfp_calculator
+        optimizer = PairingOptimizer(self.parts, margin=self.safety_margin, angle_step=15)
+        self.parts = optimizer.find_best_pairs(threshold=0.05)
+        self.nfp_calculator = NFPCalculator(self.parts, angle_step=15, margin=self.safety_margin)
         print("ステップ0: NFPの事前計算...")
         self.nfp_calculator.precompute_nfps()
 
@@ -1134,7 +1125,7 @@ class NestingAlgorithm:
         ]
 
         # 並列処理の引数を準備
-        trial_args = [(self.parts, self.bin_width, self.bin_height, s, nfp_calculator, i + 1, self.allow_rotation, self.priority) for i, s in enumerate(strategies)]
+        trial_args = [(self.parts, self.bin_width, self.bin_height, s, self.nfp_calculator, i + 1, self.allow_rotation, self.priority) for i, s in enumerate(strategies)]
         # CPUのコア数（最大3）で並列実行
         num_processes = min(mp.cpu_count(), len(strategies))
         print(f"\n{num_processes}個のプロセスで並列実行を開始...")
