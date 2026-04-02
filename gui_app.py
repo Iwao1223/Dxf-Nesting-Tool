@@ -163,8 +163,8 @@ class PrintLogger:
 class NestingApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("DXF Auto Nesting Tool Pro")
-        self.geometry("850x550")
+        self.title("DXF Auto Nesting Tool")
+        self.geometry("850x650")
         ctk.set_appearance_mode("dark")
 
         self.file_entries = {}
@@ -199,12 +199,12 @@ class NestingApp(ctk.CTk):
 
         ctk.CTkLabel(self.settings_frame, text="幅(W):").grid(row=1, column=0, padx=5, sticky="e")
         self.entry_width = ctk.CTkEntry(self.settings_frame, width=70)
-        self.entry_width.insert(0, "200")
+        self.entry_width.insert(0, "900")
         self.entry_width.grid(row=1, column=1, padx=5, pady=5)
 
         ctk.CTkLabel(self.settings_frame, text="高さ(H):").grid(row=1, column=2, padx=5, sticky="e")
         self.entry_height = ctk.CTkEntry(self.settings_frame, width=70)
-        self.entry_height.insert(0, "150")
+        self.entry_height.insert(0, "600")
         self.entry_height.grid(row=1, column=3, padx=5, pady=5)
 
         ctk.CTkLabel(self.settings_frame, text="隙間(mm):").grid(row=2, column=0, padx=5, sticky="e")

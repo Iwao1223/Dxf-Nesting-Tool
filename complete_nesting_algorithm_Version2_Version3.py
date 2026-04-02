@@ -5,6 +5,7 @@ import matplotlib
 matplotlib.rcParams['font.family'] = 'MS Gothic'  # または 'Meiryo', 'Yu Gothic' など
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, Point, LineString, MultiPolygon
+from shapely.ops import unary_union
 from shapely.affinity import rotate, translate
 from typing import List, Tuple, Dict, Any, Union, Optional
 import copy
@@ -22,8 +23,10 @@ class Part:
         self.points = points
         self.holes = holes
         self.polygon = Polygon(points, self.holes)
-        self.rotation = 0  # 現在の回転角度
-        self.position = (0, 0)  # 現在の配置位置
+        self.rotation = 0
+        self.position = (0, 0)
+        self.is_merged = False
+        self.sub_parts = []
         
     def get_area(self) -> float:
         """部品の面積を取得"""
@@ -37,6 +40,11 @@ class Part:
         part_copy.rotation = angle
         # 回転後のポイントも更新
         part_copy.points = list(rotated_polygon.exterior.coords)[:-1]  # 最後の点は最初と同じなので除外
+
+        if self.is_merged:
+            for sp in part_copy.sub_parts:
+                sp['polygon'] = rotate(sp['polygon'], angle, origin=self.polygon.centroid)
+                sp['rotation'] = (sp['rotation'] + angle) % 360
         return part_copy
     
     def translate_to(self, position: Tuple[float, float]) -> 'Part':
@@ -54,6 +62,11 @@ class Part:
         part_copy.position = position
         # 移動後のポイントも更新
         part_copy.points = list(translated_polygon.exterior.coords)[:-1]
+
+        if self.is_merged:
+            for sp in part_copy.sub_parts:
+                sp['polygon'] = translate(sp['polygon'], dx, dy)
+
         return part_copy
     
     def get_bounds(self) -> Tuple[float, float, float, float]:
@@ -239,6 +252,7 @@ class NFPCalculator:
             final_ifp = final_ifp.buffer(0)
 
         return final_ifp
+
 
 
 class ImprovedBinPacking:
@@ -889,7 +903,7 @@ class LocalSearch:
                     new_solution[i] = (part_id, new_angle)
 
                     # _evaluate_solutionの呼び出しにnfp_calculatorを渡す
-                    new_height = self._evaluate_solution(new_solution, nfp_calculator, priority='height')
+                    new_height = self._evaluate_solution(new_solution, nfp_calculator, priority=priority)
 
                     if new_height < current_best_height:
                         current_best_height = new_height
@@ -944,6 +958,149 @@ def calculate_nfp_task(task, parts_dict):
     return (part1_id, part2_id, angle), nfp
 
 
+class PairingOptimizer:
+    """事前合体（ペアリング）を行うクラス（純粋なShapely頂点マッチング版）"""
+
+    def __init__(self, parts: List[Part], margin: float = 0.0):
+        self.parts = parts
+        self.margin = margin
+
+    def find_best_pairs(self, threshold: float = 0.05) -> List[Part]:
+        print("\n" + "=" * 15 + " 自動ペアリング（事前合体）を開始 " + "=" * 15)
+        n_parts = len(self.parts)
+        if n_parts < 2:
+            return self.parts
+
+        matches = []
+        bbox_areas = {}
+        for p in self.parts:
+            minx, miny, maxx, maxy = p.get_bounds()
+            bbox_areas[p.id] = (maxx - minx) * (maxy - miny)
+
+        for i in range(n_parts):
+            part_a = self.parts[i]
+            # Aのポリゴンをマージン分膨らませ、カドの頂点を取得
+            a_buf = part_a.polygon.buffer(self.margin, resolution=2)
+            a_coords = []
+            if a_buf.geom_type == 'Polygon':
+                a_coords = list(a_buf.exterior.coords)
+            elif a_buf.geom_type in ['MultiPolygon', 'GeometryCollection']:
+                for geom in getattr(a_buf, 'geoms', []):
+                    if hasattr(geom, 'exterior'):
+                        a_coords.extend(list(geom.exterior.coords))
+
+            for j in range(i + 1, n_parts):
+                part_b = self.parts[j]
+
+                best_reduction = -999.0
+                best_combined_poly = None
+                best_angle = 0
+                best_translated_b_poly = None
+
+                # 4方向チェック
+                for angle in [0, 90, 180, 270]:
+                    rotated_b = part_b.rotate_to(angle)
+                    b_coords = list(rotated_b.polygon.exterior.coords)
+
+                    # 頂点が多すぎる場合（翼型など）は間引いて軽量化
+                    step_a = 1 if len(a_coords) < 50 else len(a_coords) // 25
+                    step_b = 1 if len(b_coords) < 50 else len(b_coords) // 25
+
+                    minx_a, miny_a, maxx_a, maxy_a = part_a.get_bounds()
+
+                    # PyClipperを使わず、AとBの頂点同士を直接くっつける（総当たりスライド）
+                    for p_a in a_coords[::step_a]:
+                        for p_b in b_coords[::step_b]:
+                            dx = p_a[0] - p_b[0]
+                            dy = p_a[1] - p_b[1]
+
+                            translated_poly_b = translate(rotated_b.polygon, dx, dy)
+
+                            # ▼ めり込み判定（1ミリでもめり込んでいたらNG）
+                            if part_a.polygon.buffer(self.margin - 0.05).intersects(translated_poly_b):
+                                continue
+
+                            # 面積計算
+                            minx_b, miny_b, maxx_b, maxy_b = translated_poly_b.bounds
+                            comb_minx = min(minx_a, minx_b)
+                            comb_miny = min(miny_a, miny_b)
+                            comb_maxx = max(maxx_a, maxx_b)
+                            comb_maxy = max(maxy_a, maxy_b)
+
+                            comb_bbox_area = (comb_maxx - comb_minx) * (comb_maxy - comb_miny)
+                            sum_bbox_area = bbox_areas[part_a.id] + bbox_areas[part_b.id]
+
+                            reduction = 1.0 - (comb_bbox_area / sum_bbox_area)
+
+                            if reduction > best_reduction:
+                                best_reduction = reduction
+                                best_angle = angle
+                                best_translated_b_poly = translated_poly_b
+
+                # 4方向試し終わった後、一番マシだった配置を検証結果として表示！
+                if best_translated_b_poly is not None:
+                    print(f"  [検証] {part_a.id} & {part_b.id} -> 最高削減率: {best_reduction * 100:.1f}%")
+
+                    # 指定した合格ライン（デフォルト5%）を超えたら重い合体処理を行う
+                    if best_reduction >= threshold:
+                        try:
+                            # 隙間の分だけ接着剤を厚く塗ってつなぎ合わせる
+                            buffer_size = (self.margin / 2.0) + 0.1
+                            combined = unary_union([
+                                part_a.polygon.buffer(buffer_size),
+                                best_translated_b_poly.buffer(buffer_size)
+                            ]).buffer(-buffer_size)
+
+                            # バラバラなら凸包（ゴムをかける）で強制的に1つの塊にする
+                            if combined.geom_type in ['MultiPolygon', 'GeometryCollection']:
+                                combined = combined.convex_hull
+
+                            if combined.geom_type == 'Polygon':
+                                matches.append({
+                                    'part_a': part_a,
+                                    'part_b': part_b,
+                                    'reduction': best_reduction,
+                                    'combined_poly': combined,
+                                    'best_angle': best_angle,
+                                    'translated_b_poly': best_translated_b_poly
+                                })
+                        except Exception as e:
+                            print(f"  [合体エラー] {part_a.id} & {part_b.id} -> {e}")
+
+        # 成績順にソートして上から採用
+        matches.sort(key=lambda x: x['reduction'], reverse=True)
+        used_ids = set()
+        new_parts = []
+
+        for match in matches:
+            pa = match['part_a']
+            pb = match['part_b']
+
+            if pa.id in used_ids or pb.id in used_ids:
+                continue
+
+            poly = match['combined_poly'].simplify(0.01, preserve_topology=True)
+            if poly.geom_type == 'Polygon':
+                points = list(poly.exterior.coords)[:-1]
+                new_part = Part(f"{pa.id}+{pb.id}", points)
+                new_part.is_merged = True
+                new_part.sub_parts = [
+                    {"id": pa.id, "polygon": pa.polygon, "rotation": pa.rotation},
+                    {"id": pb.id, "polygon": match['translated_b_poly'], "rotation": match['best_angle']}
+                ]
+                new_parts.append(new_part)
+                used_ids.add(pa.id)
+                used_ids.add(pb.id)
+                print(f"  ✨ [ペア成立] {pa.id} & {pb.id} (面積削減率: {match['reduction'] * 100:.1f}%)")
+
+        for p in self.parts:
+            if p.id not in used_ids:
+                new_parts.append(p)
+
+        print(f"事前合体完了: {n_parts}個 -> {len(new_parts)}個のブロックに集約されました。")
+        print("=" * 40 + "\n")
+        return new_parts
+
 class NestingAlgorithm:
     """ネスティングアルゴリズムのメインクラス（IFP統合版）"""
 
@@ -962,9 +1119,13 @@ class NestingAlgorithm:
         """複数の探索戦略を並列実行し、最良の結果を返す"""
         start_time = time.time()
 
+        optimizer = PairingOptimizer(self.parts, margin=self.safety_margin)
+        self.parts = optimizer.find_best_pairs(threshold=0.01)  # 15%削減を合格ラインに設定
+
         nfp_calculator = NFPCalculator(self.parts, angle_step=15, margin=self.safety_margin)
+        self.nfp_calculator = nfp_calculator
         print("ステップ0: NFPの事前計算...")
-        nfp_calculator.precompute_nfps()
+        self.nfp_calculator.precompute_nfps()
 
         strategies = [
             {"name": "バランス型", "ga_params": {"population_size": 80, "generations": 5, "mutation_rate": 0.15}},
@@ -991,6 +1152,24 @@ class NestingAlgorithm:
         print("\n" + "=" * 15 + " 最終配置の検証と診断を開始 " + "=" * 15)
         best_result_packer.run_diagnostics(self.nfp_calculator)
         # ▲▲▲
+
+        final_unpacked_parts = []
+        for p in best_result_packer.placed_parts:
+            if getattr(p, 'is_merged', False):
+                for sp in p.sub_parts:
+                    # 子部品の座標を取り出して、独立したPartに復元する
+                    sub_points = list(sp['polygon'].exterior.coords)[:-1]
+                    unpacked = Part(sp['id'], sub_points)
+                    unpacked.polygon = sp['polygon']
+                    unpacked.rotation = sp['rotation']
+                    minx, miny, _, _ = unpacked.polygon.bounds
+                    unpacked.position = (minx, miny)
+                    final_unpacked_parts.append(unpacked)
+            else:
+                final_unpacked_parts.append(p)
+
+        # 解体したリストにすり替える
+        best_result_packer.placed_parts = final_unpacked_parts
 
         print("\n" + "=" * 20 + " 全試行完了 " + "=" * 20)
         print(f"最終結果:")
