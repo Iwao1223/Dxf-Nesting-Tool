@@ -1,0 +1,430 @@
+import ezdxf
+from ezdxf import path
+from ezdxf.math import Matrix44
+import math
+from shapely.geometry import Polygon, LineString
+from shapely.ops import unary_union
+from shapely.affinity import rotate
+
+# ▼▼▼ 追加した魔法のコード ▼▼▼
+import multiprocessing.dummy as mp_dummy
+import complete_nesting_algorithm_Version2_Version3
+
+# 裏の作業員を「別プロセス」から「別スレッド」に切り替えることで、GUIが全てのログを受信できるようになります！
+complete_nesting_algorithm_Version2_Version3.mp.Pool = mp_dummy.Pool
+# ▲▲▲ ここまで ▲▲▲
+
+from complete_nesting_algorithm_Version2_Version3 import Part, NestingAlgorithm
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import threading
+import os
+import multiprocessing
+import sys
+import re
+
+
+# ===== データ構造 =====
+class OriginalShape:
+    def __init__(self, entities, polygon):
+        self.entities = entities
+        self.polygon = polygon
+        self.centroid = polygon.centroid
+
+
+# ===== 1. オートジョイン付きの図形抽出 =====
+def extract_original_shapes_from_dxf(filepath: str):
+    try:
+        doc = ezdxf.readfile(filepath)
+    except Exception as e:
+        return []
+
+    msp = doc.modelspace()
+    entities_data = []
+
+    for entity in msp:
+        try:
+            if entity.dxftype() in ['TEXT', 'MTEXT', 'HATCH', 'DIMENSION', 'INSERT']:
+                continue
+            p = path.make_path(entity)
+            vertices = list(p.flattening(distance=0.5))
+            if len(vertices) < 2:
+                continue
+            points = [(v.x, v.y) for v in vertices]
+            line = LineString(points)
+            entities_data.append({'entity': entity, 'line': line})
+        except:
+            pass
+
+    if not entities_data: return []
+
+    buffered_lines = [data['line'].buffer(0.2) for data in entities_data]
+    union_islands = unary_union(buffered_lines)
+
+    if union_islands.geom_type == 'Polygon':
+        islands = [union_islands]
+    elif union_islands.geom_type == 'MultiPolygon':
+        islands = list(union_islands.geoms)
+    else:
+        islands = []
+
+    islands = sorted(islands, key=lambda x: x.area, reverse=True)
+    final_islands = []
+
+    for island in islands:
+        exterior_poly = Polygon(island.exterior)
+        contained = False
+        for final_isl in final_islands:
+            if final_isl.contains(exterior_poly.centroid):
+                contained = True
+                break
+        if not contained:
+            final_islands.append(exterior_poly)
+
+    groups = {i: [] for i in range(len(final_islands))}
+
+    for data in entities_data:
+        line = data['line']
+        best_idx = -1
+        for i, final_isl in enumerate(final_islands):
+            if final_isl.contains(line.centroid) or final_isl.distance(line) < 0.5:
+                best_idx = i
+                break
+        if best_idx != -1:
+            groups[best_idx].append(data['entity'])
+
+    shapes = []
+    for i, entities in groups.items():
+        if not entities: continue
+        calc_poly = final_islands[i].buffer(-0.1).simplify(0.5, preserve_topology=True)
+        if calc_poly.is_empty or calc_poly.area < 1:
+            calc_poly = final_islands[i]
+        if calc_poly.is_valid and calc_poly.area > 0:
+            shapes.append(OriginalShape(entities, calc_poly))
+
+    return shapes
+
+
+# ===== 2. 図形の出力 =====
+def export_to_dxf_with_originals(placed_parts, original_shapes_dict, output_filepath: str, sheet_width: float,
+                                 sheet_height: float):
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+
+    frame_points = [(0, 0), (sheet_width, 0), (sheet_width, sheet_height), (0, sheet_height)]
+    msp.add_lwpolyline(frame_points, close=True, dxfattribs={'color': 1})
+
+    for part in placed_parts:
+        shape = original_shapes_dict[part.id]
+        cx = shape.centroid.x
+        cy = shape.centroid.y
+        angle_deg = part.rotation
+
+        rotated_poly = rotate(shape.polygon, angle_deg, origin='centroid')
+        minx_rot, miny_rot, _, _ = rotated_poly.bounds
+
+        target_x, target_y = part.position
+        dx = target_x - minx_rot
+        dy = target_y - miny_rot
+
+        m1 = Matrix44.translate(-cx, -cy, 0)
+        m2 = Matrix44.z_rotate(math.radians(angle_deg))
+        m3 = Matrix44.translate(cx, cy, 0)
+        m4 = Matrix44.translate(dx, dy, 0)
+        transform_matrix = m1 @ m2 @ m3 @ m4
+
+        for entity in shape.entities:
+            new_entity = entity.copy()
+            new_entity.transform(transform_matrix)
+            new_entity.dxf.color = 3
+            msp.add_entity(new_entity)
+
+    doc.saveas(output_filepath)
+
+
+# ===== ターミナルの出力を横取りするクラス =====
+class PrintLogger:
+    def __init__(self, log_callback, progress_callback):
+        self.terminal = sys.stdout
+        self.log_callback = log_callback
+        self.progress_callback = progress_callback
+
+    def write(self, message):
+        self.terminal.write(message)
+        if message.strip():
+            self.log_callback(message)
+            self.progress_callback(message)
+
+    def flush(self):
+        self.terminal.flush()
+
+
+# ===== GUIアプリケーション本体 =====
+class NestingApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("DXF Auto Nesting Tool Pro")
+        self.geometry("850x550")
+        ctk.set_appearance_mode("dark")
+
+        self.file_entries = {}
+
+        self.logger = PrintLogger(self.log, self.parse_progress)
+        sys.stdout = self.logger
+        sys.stderr = self.logger
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.left_panel = ctk.CTkFrame(self, fg_color="transparent")
+        self.left_panel.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+
+        self.title_label = ctk.CTkLabel(self.left_panel, text="DXF 自動ネスティング", font=("Arial", 22, "bold"))
+        self.title_label.pack(pady=(0, 10), anchor="w")
+
+        self.file_btn = ctk.CTkButton(self.left_panel, text="📁 DXFファイルを選択 (複数可)", command=self.select_files)
+        self.file_btn.pack(pady=5, fill="x")
+
+        self.file_list_frame = ctk.CTkScrollableFrame(self.left_panel, height=150)
+        self.file_list_frame.pack(pady=5, fill="x")
+
+        self.settings_frame = ctk.CTkFrame(self.left_panel)
+        self.settings_frame.pack(pady=10, fill="x", ipadx=10, ipady=10)
+
+        ctk.CTkLabel(self.settings_frame, text="【材料サイズ設定】", font=("Arial", 14, "bold")).grid(row=0, column=0,
+                                                                                                    columnspan=4,
+                                                                                                    pady=(5, 10),
+                                                                                                    sticky="w", padx=10)
+
+        ctk.CTkLabel(self.settings_frame, text="幅(W):").grid(row=1, column=0, padx=5, sticky="e")
+        self.entry_width = ctk.CTkEntry(self.settings_frame, width=70)
+        self.entry_width.insert(0, "200")
+        self.entry_width.grid(row=1, column=1, padx=5, pady=5)
+
+        ctk.CTkLabel(self.settings_frame, text="高さ(H):").grid(row=1, column=2, padx=5, sticky="e")
+        self.entry_height = ctk.CTkEntry(self.settings_frame, width=70)
+        self.entry_height.insert(0, "150")
+        self.entry_height.grid(row=1, column=3, padx=5, pady=5)
+
+        ctk.CTkLabel(self.settings_frame, text="隙間(mm):").grid(row=2, column=0, padx=5, sticky="e")
+        self.entry_margin = ctk.CTkEntry(self.settings_frame, width=70)
+        self.entry_margin.insert(0, "2.0")
+        self.entry_margin.grid(row=2, column=1, padx=5, pady=5)
+
+        self.rotation_var = ctk.BooleanVar(value=True)
+        self.chk_rotation = ctk.CTkCheckBox(self.settings_frame, text="回転を許可", variable=self.rotation_var)
+        self.chk_rotation.grid(row=2, column=2, columnspan=2, pady=5, sticky="w", padx=5)
+
+
+        ctk.CTkLabel(self.settings_frame, text="形状優先:").grid(row=3, column=0, padx=5, pady=(5, 0), sticky="e")
+
+        self.priority_var = ctk.StringVar(value="none")
+
+        self.priority_subframe = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
+        self.priority_subframe.grid(row=3, column=1, columnspan=3, sticky="w", pady=(5, 0))
+
+        ctk.CTkRadioButton(self.priority_subframe, text="面積 (標準)", variable=self.priority_var, value="none").pack(
+            side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.priority_subframe, text="高さ (平べったく)", variable=self.priority_var,
+                           value="height").pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.priority_subframe, text="幅 (縦長に)", variable=self.priority_var, value="width").pack(
+            side="left")
+
+
+        self.run_btn = ctk.CTkButton(self.left_panel, text="▶ 保存先を決めて実行", command=self.start_nesting,
+                                     fg_color="#28a745", hover_color="#218838", font=("Arial", 16, "bold"), height=40)
+        self.run_btn.pack(pady=20, fill="x")
+
+        self.right_panel = ctk.CTkFrame(self)
+        self.right_panel.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="nsew")
+
+        ctk.CTkLabel(self.right_panel, text="ターミナルログ・進行状況", font=("Arial", 14, "bold")).pack(pady=(10, 5))
+
+        self.log_box = ctk.CTkTextbox(self.right_panel, state="disabled", wrap="word", font=("Consolas", 12))
+        self.log_box.pack(padx=10, pady=5, fill="both", expand=True)
+
+        self.progress_bar = ctk.CTkProgressBar(self.right_panel, mode="determinate")
+        self.progress_bar.pack(padx=10, pady=(10, 20), fill="x")
+        self.progress_bar.set(0)
+
+    def log(self, message):
+        self.after(0, self._append_log, message)
+
+    def _append_log(self, message):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", message + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def parse_progress(self, message):
+        if "NFPの事前計算" in message:
+            self.after(0, self._set_progress, "determinate", 0.0)
+
+        match_nfp = re.search(r"NFP計算進捗:\s*([\d\.]+)%", message)
+        if match_nfp:
+            val = float(match_nfp.group(1)) / 100.0
+            self.after(0, self._set_progress, "determinate", val)
+
+        if "プロセスで並列実行を開始" in message:
+            self.after(0, self._set_progress, "indeterminate", None)
+
+        if "全試行完了" in message:
+            self.after(0, self._set_progress, "determinate", 1.0)
+
+    def _set_progress(self, mode, val=None):
+        if mode == "determinate":
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            if val is not None:
+                self.progress_bar.set(val)
+        else:
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start()
+
+    def select_files(self):
+        initial_dir = os.path.expanduser("~")
+        filepaths = filedialog.askopenfilenames(initialdir=initial_dir, filetypes=[("DXF Files", "*.dxf")])
+
+        if filepaths:
+            for widget in self.file_list_frame.winfo_children():
+                widget.destroy()
+            self.file_entries.clear()
+
+            for filepath in filepaths:
+                filename = os.path.basename(filepath)
+                row_frame = ctk.CTkFrame(self.file_list_frame, fg_color="transparent")
+                row_frame.pack(fill="x", pady=2)
+
+                lbl = ctk.CTkLabel(row_frame, text=filename, width=150, anchor="w")
+                lbl.pack(side="left", padx=5)
+
+                qty_entry = ctk.CTkEntry(row_frame, width=40)
+                qty_entry.insert(0, "1")
+                qty_entry.pack(side="right", padx=5)
+
+                ctk.CTkLabel(row_frame, text="個数:").pack(side="right")
+                self.file_entries[filepath] = qty_entry
+
+            print(f"{len(filepaths)} 件のファイルがセットされました。")
+
+    def start_nesting(self):
+        if not self.file_entries:
+            messagebox.showerror("エラー", "DXFファイルを選択してください！")
+            return
+
+        try:
+            sheet_w = float(self.entry_width.get())
+            sheet_h = float(self.entry_height.get())
+            margin = float(self.entry_margin.get())
+        except ValueError:
+            messagebox.showerror("エラー", "数値入力欄に誤りがあります！")
+            return
+
+        file_quantities = []
+        for filepath, entry in self.file_entries.items():
+            try:
+                qty = int(entry.get())
+                if qty > 0:
+                    file_quantities.append((filepath, qty))
+            except ValueError:
+                messagebox.showerror("エラー", "個数は整数で入力してください！")
+                return
+
+        if not file_quantities:
+            return
+
+        initial_dir = os.path.expanduser("~/Desktop")
+        save_path = filedialog.asksaveasfilename(
+            title="結果の保存先を指定してください",
+            initialdir=initial_dir,
+            initialfile="ネスティング結果.dxf",
+            defaultextension=".dxf",
+            filetypes=[("DXF Files", "*.dxf")]
+        )
+
+        if not save_path:
+            print("保存先の選択がキャンセルされました。")
+            return
+
+        self.run_btn.configure(state="disabled", text="⏳ 処理中...")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+        self.progress_bar.set(0)
+
+        allow_rot = self.rotation_var.get()
+        priority_val = self.priority_var.get()
+
+        threading.Thread(target=self.run_nesting_logic,
+                        args=(file_quantities, sheet_w, sheet_h, margin, allow_rot, priority_val, save_path),
+                        daemon=True).start()
+
+    def run_nesting_logic(self, file_quantities, sheet_width, sheet_height, margin, allow_rotation, priority, save_path):
+        try:
+            parts = []
+            original_shapes_dict = {}
+            part_counter = 1
+
+            print("=== ネスティング処理を開始 ===")
+            print("1. ファイルから図形データを抽出・結合しています...")
+            for filepath, qty in file_quantities:
+                shapes = extract_original_shapes_from_dxf(filepath)
+                if not shapes:
+                    print(f"⚠️ 警告: {os.path.basename(filepath)} から図形を抽出できませんでした。")
+                    continue
+
+                for _ in range(qty):
+                    for shape in shapes:
+                        part_id = f"DXF_{part_counter}"
+                        points = list(shape.polygon.exterior.coords)[:-1]
+                        parts.append(Part(part_id, points))
+                        original_shapes_dict[part_id] = shape
+                        part_counter += 1
+
+            if not parts:
+                self.show_result("エラー", "配置できる図形がありませんでした。処理を中止します。")
+                return
+
+            print(f"合計 {len(parts)} 個の部品を配置します。")
+            print(f"2. AIがパズルの最適解を計算中... (優先モード: {priority})")
+
+            nester = NestingAlgorithm(parts, sheet_width, sheet_height, safety_margin=margin,
+                                      allow_rotation=allow_rotation, priority=priority)
+            result_packer, _ = nester.run()
+
+            print("\n3. 計算完了！高品質DXFファイルを生成しています...")
+            export_to_dxf_with_originals(result_packer.placed_parts, original_shapes_dict, save_path, sheet_width,
+                                         sheet_height)
+
+            print(f"🎉 成功！ファイルを出力しました。\n保存先: {save_path}")
+
+            rot_text = "回転あり" if allow_rotation else "回転なし"
+            plot_title = f"Result ({sheet_width} x {sheet_height} / M:{margin} / {rot_text})"
+
+            self.show_result("完了", "ネスティングが完了しました！", is_success=True, result_packer=result_packer,
+                             plot_title=plot_title)
+
+        except Exception as e:
+            print(f"\n❌ エラー発生: {e}")
+            self.show_result("エラー", f"予期せぬエラー: {e}", is_success=False)
+
+    def show_result(self, title, message, is_success=False, result_packer=None, plot_title=""):
+        self.after(0, self._reset_ui, title, message, is_success, result_packer, plot_title)
+
+    def _reset_ui(self, title, message, is_success, result_packer, plot_title):
+        self.progress_bar.stop()
+        self.run_btn.configure(state="normal", text="▶ 保存先を決めて実行")
+
+        if not is_success:
+            messagebox.showerror(title, message)
+        else:
+            if result_packer:
+                result_packer.visualize(title=plot_title)
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    app = NestingApp()
+    app.mainloop()

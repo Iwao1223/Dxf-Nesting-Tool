@@ -1,0 +1,13 @@
+/.idea/
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# 出力結果やテスト用ファイル
+*.dxf
+*.png
