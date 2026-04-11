@@ -5,10 +5,12 @@ import math
 from shapely.geometry import Polygon, LineString
 from shapely.ops import unary_union
 from shapely.affinity import rotate
+from PIL import Image
 
 # ▼▼▼ 追加した魔法のコード ▼▼▼
 import multiprocessing.dummy as mp_dummy
 import complete_nesting_algorithm_Version2_Version3
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 # 裏の作業員を「別プロセス」から「別スレッド」に切り替えることで、GUIが全てのログを受信できるようになります！
 complete_nesting_algorithm_Version2_Version3.mp.Pool = mp_dummy.Pool
@@ -106,13 +108,16 @@ def extract_original_shapes_from_dxf(filepath: str):
 
 
 # ===== 2. 図形の出力 =====
+# ===== 2. 図形の出力 =====
 def export_to_dxf_with_originals(placed_parts, original_shapes_dict, output_filepath: str, sheet_width: float,
-                                 sheet_height: float):
+                                 sheet_height: float, alignment: str): # ← alignment を追加
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
 
     frame_points = [(0, 0), (sheet_width, 0), (sheet_width, sheet_height), (0, sheet_height)]
     msp.add_lwpolyline(frame_points, close=True, dxfattribs={'color': 1})
+
+    placed_entities = [] # ★配置したエンティティを記憶するリスト
 
     for part in placed_parts:
         shape = original_shapes_dict[part.id]
@@ -138,6 +143,25 @@ def export_to_dxf_with_originals(placed_parts, original_shapes_dict, output_file
             new_entity.transform(transform_matrix)
             new_entity.dxf.color = 3
             msp.add_entity(new_entity)
+            placed_entities.append(new_entity) # リストに追加
+
+    # ▼▼▼ 最後に、指定に合わせてエンティティ全体をミラー反転 ▼▼▼
+    if alignment == 'top_left':
+        # Y軸で反転させて、上に持ち上げる
+        m_total = Matrix44.scale(1, -1, 1) @ Matrix44.translate(0, sheet_height, 0)
+        for ent in placed_entities:
+            ent.transform(m_total)
+    elif alignment == 'bottom_right':
+        # X軸で反転させて、右に寄せる
+        m_total = Matrix44.scale(-1, 1, 1) @ Matrix44.translate(sheet_width, 0, 0)
+        for ent in placed_entities:
+            ent.transform(m_total)
+    elif alignment == 'top_right':
+        # XY両方で反転させて、右上に寄せる
+        m_total = Matrix44.scale(-1, -1, 1) @ Matrix44.translate(sheet_width, sheet_height, 0)
+        for ent in placed_entities:
+            ent.transform(m_total)
+    # ▲▲▲
 
     doc.saveas(output_filepath)
 
@@ -150,7 +174,14 @@ class PrintLogger:
         self.progress_callback = progress_callback
 
     def write(self, message):
-        self.terminal.write(message)
+        # ターミナル（self.terminal）が存在する場合のみ書き込む
+        if self.terminal is not None:
+            try:
+                self.terminal.write(message)
+            except:
+                pass
+
+        # GUIのログボックスへの書き込みはターミナルの有無に関わらず実行
         if message.strip():
             self.log_callback(message)
             self.progress_callback(message)
@@ -164,7 +195,7 @@ class NestingApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("DXF Auto Nesting Tool")
-        self.geometry("850x650")
+        self.geometry("1100x750")
         ctk.set_appearance_mode("dark")
 
         self.file_entries = {}
@@ -173,8 +204,9 @@ class NestingApp(ctk.CTk):
         sys.stdout = self.logger
         sys.stderr = self.logger
 
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
+
+        self.grid_columnconfigure(0, weight=1, minsize=400)
+        self.grid_columnconfigure(1, weight=2)
         self.grid_rowconfigure(0, weight=1)
 
         self.left_panel = ctk.CTkFrame(self, fg_color="transparent")
@@ -231,6 +263,30 @@ class NestingApp(ctk.CTk):
         ctk.CTkRadioButton(self.priority_subframe, text="幅 (縦長に)", variable=self.priority_var, value="width").pack(
             side="left")
 
+        ctk.CTkLabel(self.settings_frame, text="配置基準:").grid(row=4, column=0, padx=5, pady=(5, 0), sticky="e")
+        self.alignment_var = ctk.StringVar(value="bottom_left")
+        self.align_subframe = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
+        self.align_subframe.grid(row=4, column=1, columnspan=3, sticky="w", pady=(5, 0))
+        ctk.CTkRadioButton(self.align_subframe, text="左下 (標準)", variable=self.alignment_var,
+                           value="bottom_left").pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.align_subframe, text="左上 (レーザー用)", variable=self.alignment_var,
+                           value="top_left").pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.align_subframe, text="右下", variable=self.alignment_var, value="bottom_right").pack(
+            side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.align_subframe, text="右上", variable=self.alignment_var, value="top_right").pack(
+            side="left")
+
+        ctk.CTkLabel(self.settings_frame, text="計算モード:").grid(row=5, column=0, padx=5, pady=(5, 0), sticky="e")
+        self.accuracy_var = ctk.StringVar(value="normal")
+        self.acc_subframe = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
+        self.acc_subframe.grid(row=5, column=1, columnspan=3, sticky="w", pady=(5, 0))
+        ctk.CTkRadioButton(self.acc_subframe, text="精密 (時間大)", variable=self.accuracy_var, value="high").pack(
+            side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.acc_subframe, text="標準 (おすすめ)", variable=self.accuracy_var, value="normal").pack(
+            side="left", padx=(0, 10))
+        ctk.CTkRadioButton(self.acc_subframe, text="爆速 (粗め)", variable=self.accuracy_var, value="fast").pack(
+            side="left")
+
 
         self.run_btn = ctk.CTkButton(self.left_panel, text="▶ 保存先を決めて実行", command=self.start_nesting,
                                      fg_color="#28a745", hover_color="#218838", font=("Arial", 16, "bold"), height=40)
@@ -239,13 +295,33 @@ class NestingApp(ctk.CTk):
         self.right_panel = ctk.CTkFrame(self)
         self.right_panel.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="nsew")
 
-        ctk.CTkLabel(self.right_panel, text="ターミナルログ・進行状況", font=("Arial", 14, "bold")).pack(pady=(10, 5))
+        # タブビューを作成
+        self.tab_view = ctk.CTkTabview(self.right_panel)
+        self.tab_view.pack(padx=10, pady=(10, 5), fill="both", expand=True)  # 余白を少し調整
 
-        self.log_box = ctk.CTkTextbox(self.right_panel, state="disabled", wrap="word", font=("Consolas", 12))
-        self.log_box.pack(padx=10, pady=5, fill="both", expand=True)
+        self.tab_log = self.tab_view.add("ログ")
+        self.tab_preview = self.tab_view.add("プレビュー")
 
+        # --- ▼▼▼ ここを修正 ▼▼▼ ---
+        # プレビュータブの中身をスクロール可能にする
+        # self.tab_preview 自体をスクロールフレームにするのではなく、
+        # その中にスクロールフレームを配置します。
+        self.preview_frame = ctk.CTkFrame(self.tab_preview, fg_color="transparent")
+        self.preview_frame.pack(fill="both", expand=True)
+        self.canvas_widget = None
+        self.toolbar_widget = None
+
+        self.preview_label = ctk.CTkLabel(self.preview_frame, text="計算完了後にここに配置結果が表示されます")
+        self.preview_label.pack(padx=5, pady=5, expand=True, anchor="center")
+        # --- ▲▲▲ ここまで修正 ▲▲▲ ---
+
+        # ログタブの中身
+        self.log_box = ctk.CTkTextbox(self.tab_log, state="disabled", wrap="word", font=("Consolas", 12))
+        self.log_box.pack(padx=5, pady=5, fill="both", expand=True)
+
+        # プログレスバー
         self.progress_bar = ctk.CTkProgressBar(self.right_panel, mode="determinate")
-        self.progress_bar.pack(padx=10, pady=(10, 20), fill="x")
+        self.progress_bar.pack(padx=10, pady=(0, 15), fill="x")
         self.progress_bar.set(0)
 
     def log(self, message):
@@ -356,12 +432,17 @@ class NestingApp(ctk.CTk):
 
         allow_rot = self.rotation_var.get()
         priority_val = self.priority_var.get()
+        alignment_val = self.alignment_var.get()
+        accuracy_val = self.accuracy_var.get()
 
         threading.Thread(target=self.run_nesting_logic,
-                        args=(file_quantities, sheet_w, sheet_h, margin, allow_rot, priority_val, save_path),
-                        daemon=True).start()
+                         args=(file_quantities, sheet_w, sheet_h, margin, allow_rot, priority_val, alignment_val,
+                               accuracy_val, save_path),
+                         daemon=True).start()
 
-    def run_nesting_logic(self, file_quantities, sheet_width, sheet_height, margin, allow_rotation, priority, save_path):
+    def run_nesting_logic(self, file_quantities, sheet_width, sheet_height, margin, allow_rotation, priority, alignment,
+                          accuracy, save_path):
+
         try:
             parts = []
             original_shapes_dict = {}
@@ -388,40 +469,95 @@ class NestingApp(ctk.CTk):
                 return
 
             print(f"合計 {len(parts)} 個の部品を配置します。")
-            print(f"2. AIがパズルの最適解を計算中... (優先モード: {priority})")
+            # ... (中略) ...
+            print(f"2. パズルの最適解を計算中... (優先モード: {priority} / 配置基準: {alignment})")
 
+            # ▼ 最後に alignment=alignment を追加！
             nester = NestingAlgorithm(parts, sheet_width, sheet_height, safety_margin=margin,
-                                      allow_rotation=allow_rotation, priority=priority)
+                                      allow_rotation=allow_rotation, priority=priority, alignment=alignment,
+                                      accuracy=accuracy)
             result_packer, _ = nester.run()
+
+            # ▼▼▼ AIの計算が終わった後、DXF出力の直前にキャンバスを反転させる ▼▼▼
+            if alignment == 'top_left':
+                result_packer.flip_to_top_left()
+            elif alignment == 'bottom_right':
+                result_packer.flip_to_bottom_right()
+            elif alignment == 'top_right':
+                result_packer.flip_to_top_right()
+            # ▲▲▲
 
             print("\n3. 計算完了！高品質DXFファイルを生成しています...")
             export_to_dxf_with_originals(result_packer.placed_parts, original_shapes_dict, save_path, sheet_width,
-                                         sheet_height)
+                                         sheet_height, alignment)  # ← 一番最後に alignment を追加！
 
             print(f"🎉 成功！ファイルを出力しました。\n保存先: {save_path}")
 
             rot_text = "回転あり" if allow_rotation else "回転なし"
             plot_title = f"Result ({sheet_width} x {sheet_height} / M:{margin} / {rot_text})"
 
-            self.show_result("完了", "ネスティングが完了しました！", is_success=True, result_packer=result_packer,
-                             plot_title=plot_title)
+            preview_img_path = os.path.join(os.path.dirname(save_path), "preview_nesting.png")
+
+            # ▼▼▼ 画像ではなく、Figure(グラフ本体)を取得する。ダークモードもON ▼▼▼
+            fig = result_packer.visualize(save_path=preview_img_path, show_plot=False,
+                                          title=plot_title, return_fig=True, dark_mode=True,
+                                          fixed_figsize=(6, 4))
+
+            # ▼▼▼ 新規追加：最終結果が枠に収まっているかチェックしてメッセージを変える ▼▼▼
+            final_h = result_packer.get_bin_height()
+            final_w = result_packer.get_bin_width_used()
+
+            if final_h > sheet_height or final_w > sheet_width:
+                msg_title = "完了 (※はみ出し警告)"
+                msg_body = f"指定された材料サイズ({sheet_width}x{sheet_height})に収まりきらず、はみ出た状態で出力されました。\n部品を減らすか、材料サイズを大きくしてください。"
+            else:
+                msg_title = "完了"
+                msg_body = "ネスティングが完了しました！"
+
+            self.show_result(msg_title, msg_body, is_success=True, result_packer=result_packer,
+                             plot_title=plot_title, fig=fig)
+
 
         except Exception as e:
+            # ...
             print(f"\n❌ エラー発生: {e}")
             self.show_result("エラー", f"予期せぬエラー: {e}", is_success=False)
 
-    def show_result(self, title, message, is_success=False, result_packer=None, plot_title=""):
-        self.after(0, self._reset_ui, title, message, is_success, result_packer, plot_title)
+    def show_result(self, title, message, is_success=False, result_packer=None, plot_title="", fig=None):
+        self.after(0, self._reset_ui, title, message, is_success, result_packer, plot_title, fig)
 
-    def _reset_ui(self, title, message, is_success, result_packer, plot_title):
+    def _reset_ui(self, title, message, is_success, result_packer, plot_title, fig):
         self.progress_bar.stop()
         self.run_btn.configure(state="normal", text="▶ 保存先を決めて実行")
 
         if not is_success:
             messagebox.showerror(title, message)
         else:
-            if result_packer:
-                result_packer.visualize(title=plot_title)
+            # ▼▼▼ MatplotlibのグラフをGUIに直接埋め込む ▼▼▼
+            if fig:
+                # 古いキャンバスがあれば削除
+                if self.canvas_widget:
+                    self.canvas_widget.destroy()
+                if self.toolbar_widget:
+                    self.toolbar_widget.destroy()
+
+                # 新しいキャンバスを作成して配置
+                canvas = FigureCanvasTkAgg(fig, master=self.preview_frame)
+                canvas.draw()
+
+                # CADらしく、ズームや移動ができるツールバーを追加！
+                self.toolbar_widget = ctk.CTkFrame(self.preview_frame, height=40)
+                self.toolbar_widget.pack(side="bottom", fill="x", pady=(5, 0))
+                toolbar = NavigationToolbar2Tk(canvas, self.toolbar_widget)
+                toolbar.update()
+
+                self.canvas_widget = canvas.get_tk_widget()
+                self.canvas_widget.pack(side="top", fill="both", expand=True)
+
+                # 自動的に「プレビュー」タブに切り替える
+                self.tab_view.set("プレビュー")
+
+            messagebox.showinfo(title, message)
 
 
 if __name__ == "__main__":

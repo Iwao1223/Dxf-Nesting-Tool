@@ -258,9 +258,10 @@ class NFPCalculator:
 class ImprovedBinPacking:
     """改良版ビンパッキングクラス（安定版・空き領域管理機能付き）"""
 
-    def __init__(self, bin_width: float, bin_height: float, frame_output_dir: str = None):
+    def __init__(self, bin_width: float, bin_height: float, frame_output_dir: str = None, alignment: str = 'bottom_left'):
         self.bin_width = bin_width
         self.bin_height = bin_height
+        self.alignment = alignment
         self.placed_parts: List[Part] = []
 
         # 初期の空き領域は全体のビン（十分な高さを仮定）
@@ -295,28 +296,21 @@ class ImprovedBinPacking:
         self.free_spaces = new_free_spaces
 
     def _generate_candidate_positions(self, part: Part) -> List[Tuple[float, float]]:
-        """配置候補位置を生成（接触を回避する最終確定版）"""
+        """配置候補位置を生成（左下詰め専用の超安定版に戻す）"""
         if not self.placed_parts:
             return [(0, 0)]
 
         candidates = set()
-        epsilon = 0.01  # 接触を回避するための非常に小さな隙間
+        epsilon = 0.01
 
         max_height = 0
         for p in self.placed_parts:
             minx, miny, maxx, maxy = p.get_bounds()
-
-            # 1. 右隣に配置する候補（わずかに隙間を空ける）
-            candidates.add((maxx + epsilon, miny))
-
-            # 2. 真上に配置する候補（わずかに隙間を空ける）
-            candidates.add((minx, maxy + epsilon))
-
+            candidates.add((maxx + epsilon, miny))  # 右に置く
+            candidates.add((minx, maxy + epsilon))  # 上に置く
             max_height = max(max_height, maxy)
 
-        # 3. ビンの左上（新しい行）から配置する候補
-        candidates.add((0, max_height + epsilon))
-
+        candidates.add((0, max_height + epsilon)) # 新しい段
         return list(candidates)
 
     def find_optimal_position(self, part: Part, nfp_calculator: 'NFPCalculator', priority: str = 'none') -> Tuple[float, float]:
@@ -355,16 +349,15 @@ class ImprovedBinPacking:
                 test_part = part.translate_to(pos)
                 test_bounds = test_part.get_bounds()
 
-                if (test_bounds[0] < -margin or
-                        test_bounds[2] > self.bin_width + margin or
-                        test_bounds[1] < -margin or
-                        test_bounds[3] > self.bin_height + margin):  # ← この行(Y軸上限のチェック)を追加
+                if (test_bounds[0] < -0.01 or
+                        test_bounds[2] > self.bin_width + 0.01 or
+                        test_bounds[1] < -0.01 or
+                        test_bounds[3] > self.bin_height + 0.01):
                     continue
 
-                # --- 衝突判定を確実な intersects() にします（マージン対応版） ---
+                    # 衝突判定
                 collision = False
                 for placed in self.placed_parts:
-                    # バウンディングボックスチェックはそのまま
                     placed_bounds = placed.get_bounds()
                     if (test_bounds[2] < placed_bounds[0] - margin or
                             test_bounds[0] > placed_bounds[2] + margin or
@@ -372,14 +365,11 @@ class ImprovedBinPacking:
                             test_bounds[1] > placed_bounds[3] + margin):
                         continue
 
-                    # ★ 配置済み部品をマージン分だけ大きくして（buffer）、衝突判定を行う
                     if placed.polygon.buffer(margin).intersects(test_part.polygon):
                         collision = True
                         break
 
                 if not collision:
-                    # 基本は原点への距離の二乗（面積最小化）
-                    # 緩い制約として、抑え込みたい方向に重み(1.5)をかけてペナルティを増やす
                     if priority == 'height':
                         metric = pos[0] ** 2 + (pos[1] * 1.5) ** 2
                     elif priority == 'width':
@@ -390,15 +380,28 @@ class ImprovedBinPacking:
                     valid_positions.append((pos, metric))
             except Exception as e:
                 print(f"候補位置検証エラー: {e}")
-        # --- ▲▲▲ 修正ここまで ▲▲▲ ---
+
+            if not valid_positions:
+                max_height = 0
+                if self.placed_parts:
+                    max_height = max(p.get_bounds()[3] for p in self.placed_parts)
+                return (0, max_height + margin)
+
+            return min(valid_positions, key=lambda x: x[1])[0]
 
         if not valid_positions:
-            # 配置可能な位置が見つからなかった場合、現在の最高高さの上に配置
-            max_height = 0
-            if self.placed_parts:
-                max_height = max(p.get_bounds()[3] for p in self.placed_parts)
-            # Y方向にもマージンを追加
-            return (0, max_height + margin)
+            # 配置エラー時は重ならないように枠外へ退避
+            part_h = part.get_bounds()[3] - part.get_bounds()[1]
+            if self.alignment in ['top_left', 'top_right']:
+                min_height = self.bin_height
+                if self.placed_parts:
+                    min_height = min(p.get_bounds()[1] for p in self.placed_parts)
+                return (0, min_height - margin - part_h)
+            else:
+                max_height = 0
+                if self.placed_parts:
+                    max_height = max(p.get_bounds()[3] for p in self.placed_parts)
+                return (0, max_height + margin)
 
         return min(valid_positions, key=lambda x: x[1])[0]
         # """最適配置位置を見つける（IFP候補生成 + NFP衝突判定による最終版）""""""NFPを使用して最適配置位置を見つける（基準点問題を修正した最終版）"""
@@ -443,7 +446,7 @@ class ImprovedBinPacking:
         #         max_height = max(p.get_bounds()[3] for p in self.placed_parts)
         #     return (0, max_height + 0.1)
 
-        return min(valid_positions, key=lambda x: x[1])[0]
+        #return min(valid_positions, key=lambda x: x[1])[0]
 
     def place_part(self, part: Part, position: Tuple[float, float]) -> None:
         """部品を指定位置に配置し、空き領域を更新"""
@@ -461,12 +464,19 @@ class ImprovedBinPacking:
 
     def get_bin_height(self) -> float:
         if not self.placed_parts: return 0
-        return max(p.get_bounds()[3] for p in self.placed_parts)
+        if self.alignment in ['top_left', 'top_right']:
+            min_y = min(p.get_bounds()[1] for p in self.placed_parts)
+            return self.bin_height - min_y
+        else:
+            return max(p.get_bounds()[3] for p in self.placed_parts)
 
     def get_bin_width_used(self) -> float:
-        """現在配置されている部品の最大幅（Xの最大値）を取得"""
         if not self.placed_parts: return 0
-        return max(p.get_bounds()[2] for p in self.placed_parts)
+        if self.alignment in ['bottom_right', 'top_right']:
+            min_x = min(p.get_bounds()[0] for p in self.placed_parts)
+            return self.bin_width - min_x
+        else:
+            return max(p.get_bounds()[2] for p in self.placed_parts)
 
     def get_utilization(self) -> float:
         total_area = sum(part.get_area() for part in self.placed_parts)
@@ -474,20 +484,29 @@ class ImprovedBinPacking:
         return total_area / bin_area if bin_area > 0 else 0
 
     def visualize(self, save_path: str = None, show_plot: bool = True, title: str = None,
-                  # ▼▼▼ 新しい引数を追加 ▼▼▼
-                  fixed_figsize: tuple = None, fixed_ylim: float = None):
+                  fixed_figsize: tuple = None, fixed_ylim: float = None,
+                  return_fig: bool = False, dark_mode: bool = False):  # ← 引数を追加
         """配置結果を可視化（タイトル追加、プロット管理強化）"""
         final_height = self.get_bin_height()
         if final_height == 0:
-            if save_path: # 保存先が指定されている場合は空のプロットを閉じる
+            if save_path:
                 plt.close('all')
-            return
+            return None
+
+        # ▼▼▼ ダークモードの設定 ▼▼▼
+        if dark_mode:
+            plt.style.use('dark_background')
+            matplotlib.rcParams['axes.facecolor'] = '#2b2b2b'
+            matplotlib.rcParams['figure.facecolor'] = '#2b2b2b'
+        else:
+            plt.style.use('default')
+        # スタイル変更後にフォントを再設定しないと文字化けする
+        matplotlib.rcParams['font.family'] = 'MS Gothic'
+        # ▲▲▲
 
         if fixed_figsize:
-            # 動画フレーム生成時は、指定された固定サイズを使用
             fig, ax = plt.subplots(figsize=fixed_figsize)
         else:
-            # 通常の可視化では、これまで通り動的にサイズを計算
             fig_width = 8
             fig_height = (final_height / self.bin_width) * fig_width if self.bin_width > 0 else 6
             fig_height = max(fig_height, 6)
@@ -495,53 +514,57 @@ class ImprovedBinPacking:
 
         # 各部品を描画
         colors = plt.cm.tab20(np.linspace(0, 1, 20))
+        # 各部品を描画
+        colors = plt.cm.tab20(np.linspace(0, 1, 20))
         for i, part in enumerate(self.placed_parts):
-            # ポリゴンを閉じるために、最初の点を末尾に追加
-            points_to_draw = part.points + [part.points[0]]
+
+            # ▼▼▼ 新規追加：描画の時だけ図形を少しシンプルにしてラグをなくす！ ▼▼▼
+            # （※実際のDXFデータや配置計算には影響しません）
+            draw_poly = part.polygon.simplify(0.5, preserve_topology=False)
+            if draw_poly.geom_type == 'Polygon':
+                points_to_draw = list(draw_poly.exterior.coords)
+            else:
+                points_to_draw = part.points + [part.points[0]]  # フォールバック
+            # ▲▲▲
+
             x, y = zip(*points_to_draw)
 
-            ax.fill(x, y, alpha=0.8, color=colors[i % 20],
-                    label=f"Part {part.id} ({part.rotation}°)")
+            ax.fill(x, y, alpha=0.8, color=colors[i % 20], label=f"Part {part.id} ({part.rotation}°)")
 
-            # 部品IDをポリゴンの代表点に表示
             try:
                 rep_point = part.polygon.representative_point()
                 ax.text(rep_point.x, rep_point.y, part.id,
                         ha='center', va='center', fontsize=8, color='white',
                         bbox=dict(boxstyle='round,pad=0.1', fc='black', alpha=0.4))
             except Exception:
-                # 代表点が計算できない場合でもエラーにしない
                 pass
 
-        # 描画範囲とアスペクト比を厳密に設定
         ax.set_aspect('equal', adjustable='box')
         ax.set_xlim(0, self.bin_width)
         if fixed_ylim:
             ax.set_ylim(0, fixed_ylim)
         else:
-            # ▼ final_height から self.bin_height に変更して、枠の表示を固定する
             ax.set_ylim(0, self.bin_height)
+
         if title:
             ax.set_title(title)
         else:
             ax.set_title(f'ネスティング結果 (利用率: {self.get_utilization():.2%})')
 
         ax.legend(loc='upper right')
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-        # tight_layout() は、このようなプロットでは自動調整が失敗することがあるため使用しない
+        ax.grid(True, linestyle='--', alpha=0.3)  # グリッドを少し薄く
 
         if save_path:
             plt.savefig(save_path, bbox_inches='tight')
 
-            # ▼▼▼ 表示/非表示の切り替えを追加 ▼▼▼
         if show_plot:
             plt.show()
 
-            # フレーム保存時はメモリを解放するため、プロットを閉じる
-        plt.close(fig)
+        # ▼▼▼ 修正：GUIに埋め込むためにFigureオブジェクトを返す ▼▼▼
+        if return_fig:
+            return fig
 
-    # ▼▼▼ 以下の3つのメソッドを ImprovedBinPacking クラスに追加 ▼▼▼
+        plt.close(fig)
 
     def verify_placement(self) -> bool:
         """部品の重なりがないか検証する"""
@@ -629,14 +652,44 @@ class ImprovedBinPacking:
         print(f"  不一致の視覚化を {filename} に保存しました。")
         plt.close(fig)
 
-    # ▲▲▲ ここまでを追加 ▲▲▲
+    # ▼▼▼ 新規追加：キャンバスを反転させる後処理メソッド ▼▼▼
+    def flip_to_top_left(self):
+        """配置結果全体をY軸方向にミラー反転し、左上に移動させる"""
+        from shapely.affinity import scale, translate
+        for part in self.placed_parts:
+            # 1. 上下反転
+            flipped = scale(part.polygon, xfact=1.0, yfact=-1.0, origin=(0, 0))
+            # 2. 板の天井（bin_height）まで持ち上げる
+            moved = translate(flipped, xoff=0, yoff=self.bin_height)
+
+            part.polygon = moved
+            part.points = list(moved.exterior.coords)[:-1]
+
+    def flip_to_bottom_right(self):
+        """配置結果全体をX軸方向にミラー反転し、右下に移動させる"""
+        from shapely.affinity import scale, translate
+        for part in self.placed_parts:
+            # 1. 左右反転
+            flipped = scale(part.polygon, xfact=-1.0, yfact=1.0, origin=(0, 0))
+            # 2. 板の右端（bin_width）まで寄せる
+            moved = translate(flipped, xoff=self.bin_width, yoff=0)
+
+            part.polygon = moved
+            part.points = list(moved.exterior.coords)[:-1]
+
+    def flip_to_top_right(self):
+        """配置結果全体を上下左右にミラー反転し、右上に移動させる"""
+        self.flip_to_top_left()
+        self.flip_to_bottom_right()
+    # ▲▲▲ 追加ここまで ▲▲▲
 
 class GeneticAlgorithm:
     """遺伝的アルゴリズムによる最適順序と回転角度の探索"""
-    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, # ← bin_height 追加
-                 population_size: int = 40, generations: int = 60,
+
+    def __init__(self, parts: List[Part], bin_width: float, bin_height: float,
+                 population_size: int = 40, generations: int = 60, patience: int = 15,
                  mutation_rate: float = 0.15, crossover_rate: float = 0.8,
-                 angle_step: int = 15, priority: str = 'none'):
+                 angle_step: int = 15, priority: str = 'none', alignment: str = 'bottom_left'):
         self.parts = parts
         self.bin_width = bin_width
         self.bin_height = bin_height
@@ -646,6 +699,8 @@ class GeneticAlgorithm:
         self.crossover_rate = crossover_rate
         self.angle_step = angle_step
         self.priority = priority
+        self.alignment = alignment
+        self.patience = patience
         self.nfp_calculator = None
         
     def initialize_population(self) -> List[List[Tuple[str, float]]]:
@@ -669,7 +724,7 @@ class GeneticAlgorithm:
 
     def evaluate_individual(self, individual: List[Tuple[str, float]]) -> float:
         """個体の適応度を評価（面積ベース ＋ 緩い形状制約）"""
-        bin_packer = ImprovedBinPacking(self.bin_width, self.bin_height)
+        bin_packer = ImprovedBinPacking(self.bin_width, self.bin_height, alignment=self.alignment)
 
         for part_id, angle in individual:
             part = next(p for p in self.parts if p.id == part_id)
@@ -689,6 +744,10 @@ class GeneticAlgorithm:
             score = (bin_width_used ** 1.1) * bin_height
         else:
             score = bin_width_used * bin_height
+
+            # ▼▼▼ 新規追加：枠からはみ出たら「1000万点」のペナルティを与えて絶対に選ばれないようにする ▼▼▼
+        if bin_height > self.bin_height or bin_width_used > self.bin_width:
+            score += 10000000
 
         return 1.0 / (score + 1)
         
@@ -758,7 +817,7 @@ class GeneticAlgorithm:
 
 
         # ▼▼▼ 収束判定用の変数を追加 ▼▼▼
-        patience = 20  # 20世代改善がなければ収束したとみなす
+        patience = self.patience  # 20世代改善がなければ収束したとみなす
         generations_without_improvement = 0
         # ▲▲▲ 追加ここまで ▲▲▲
 
@@ -825,7 +884,7 @@ class GeneticAlgorithm:
             fitness_values = [self.evaluate_individual(ind) for ind in population]
 
             # --- フレーム保存ロジック ---
-            packer = ImprovedBinPacking(self.bin_width, self.bin_height)
+            packer = ImprovedBinPacking(self.bin_width, self.bin_height, alignment=self.alignment)
             best_ind_in_gen = population[fitness_values.index(max(fitness_values))]
             for part_id, angle in best_ind_in_gen:
                 part = next(p for p in self.parts if p.id == part_id)
@@ -864,12 +923,13 @@ class GeneticAlgorithm:
 
 class LocalSearch:
     """ローカル探索による角度の微調整（改良版）"""
-    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, angle_range: int = 10, angle_step: int = 2): # ← bin_height 追加
+    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, angle_range: int = 10, angle_step: int = 2, alignment: str = 'bottom_left'):
         self.parts = parts
         self.bin_width = bin_width
         self.bin_height = bin_height
         self.angle_range = angle_range  # 微調整する角度範囲
         self.angle_step = angle_step    # 微調整の角度ステップ
+        self.alignment = alignment
 
     def optimize_angles(self, solution: List[Tuple[str, float]], nfp_calculator: 'NFPCalculator', priority: str = 'none') -> List[Tuple[str, float]]:
         """各部品の角度を微調整して最適化（nfp_calculatorを正しく受け取る修正版）"""
@@ -920,7 +980,7 @@ class LocalSearch:
     def _evaluate_solution(self, solution: List[Tuple[str, float]], nfp_calculator: 'NFPCalculator',
                            priority: str = 'none') -> float:
         """解の評価"""
-        bin_packer = ImprovedBinPacking(self.bin_width, self.bin_height)
+        bin_packer = ImprovedBinPacking(self.bin_width, self.bin_height, alignment=self.alignment)
 
         for part_id, angle in solution:
             part = next(p for p in self.parts if p.id == part_id)
@@ -933,13 +993,18 @@ class LocalSearch:
         bin_height = bin_packer.get_bin_height()
         bin_width_used = bin_packer.get_bin_width_used()
 
-        # ▼▼▼ こちらも同じく1.1乗のペナルティ ▼▼▼
         if priority == 'height':
-            return bin_width_used * (bin_height ** 1.1)
+            score = bin_width_used * (bin_height ** 1.1)
         elif priority == 'width':
-            return (bin_width_used ** 1.1) * bin_height
+            score = (bin_width_used ** 1.1) * bin_height
         else:
-            return bin_width_used * bin_height
+            score = bin_width_used * bin_height
+
+            # ▼▼▼ 新規追加：ローカル探索でもはみ出しは絶対に許さない ▼▼▼
+        if bin_height > self.bin_height or bin_width_used > self.bin_width:
+            score += 10000000
+
+        return score
 
 
 # マルチプロセシング用の関数をクラス外に移動
@@ -961,15 +1026,28 @@ def calculate_nfp_task(task, parts_dict):
 class PairingOptimizer:
     """事前合体（ペアリング）を行うクラス（究極版：真の「ブロック充填効率」ベース）"""
 
-    def __init__(self, parts: List[Part], margin: float = 0.0, angle_step: int = 15):
+    def __init__(self, parts: List[Part], margin: float = 0.0, accuracy: str = 'normal'):
         self.parts = parts
         self.margin = margin
-        self.angle_step = angle_step
+        self.accuracy = accuracy
 
-    def find_best_pairs(self, threshold: float = 0.55) -> List[Part]:  # 充填効率55%以上（半分以上が中身）で合格
+    def find_best_pairs(self, threshold: float = 0.55) -> List[Part]:
         from shapely.geometry import MultiPoint
 
-        print("\n" + "=" * 15 + f" 自動ペアリング（真のブロック充填効率ベース）を開始 " + "=" * 15)
+        if self.accuracy == 'high':
+            simp_val = 1.0  # 頂点を細かく残す
+            step_div = 12  # 衝突判定の点数（多め）
+            angle_step = 15  # 回転の刻み（細かい）
+        elif self.accuracy == 'fast':
+            simp_val = 4.0  # 大雑把な図形にする
+            step_div = 4  # 衝突判定の点数（少ない）
+            angle_step = 45  # 回転の刻み（粗い）
+        else:  # 'normal'
+            simp_val = 2.0
+            step_div = 8
+            angle_step = 30
+
+        print("\n" + "=" * 15 + f" 自動ペアリング（モード: {self.accuracy}）を開始 " + "=" * 15)
         n_parts = len(self.parts)
         if n_parts < 2: return self.parts
 
@@ -978,14 +1056,19 @@ class PairingOptimizer:
         for i in range(n_parts):
             part_a = self.parts[i]
             area_a = part_a.get_area()
-            a_coords_full = list(part_a.polygon.exterior.coords)
 
-            # 衝突判定用のマージン付きポリゴン（角を尖らせて風船化を防ぐ）
-            a_collision_buf = part_a.polygon.buffer(max(0, self.margin - 0.05), join_style=2)
+            # ▼▼▼ 修正：計算用に頂点を間引いた「粗いポリゴン(sim_a)」を作る ▼▼▼
+            sim_a = part_a.polygon.simplify(simp_val, preserve_topology=True)
+            a_coords_full = list(sim_a.exterior.coords)
 
-            # 探索レール（マージン+0.2mm外側を滑らせる）
+            # 衝突判定用のマージン付きポリゴン（これも粗いベースで作る）
+            a_collision_buf = sim_a.buffer(max(0, self.margin - 0.05), join_style=2)
+
+            # 探索レール（マージン+0.2mm外側を滑らせる、resolution=1で軽くする）
             rail_margin = self.margin + 0.2 if self.margin > 0 else 0.2
-            a_rail_buf = part_a.polygon.buffer(rail_margin, resolution=2, join_style=2)
+            a_rail_buf = sim_a.buffer(rail_margin, resolution=1, join_style=2)
+            # ▲▲▲
+
             a_rail_coords = []
             if a_rail_buf.geom_type == 'Polygon':
                 a_rail_coords = list(a_rail_buf.exterior.coords)
@@ -999,18 +1082,20 @@ class PairingOptimizer:
                 area_b = part_b.get_area()
                 total_area = area_a + area_b
 
+                # ▼▼▼ 修正：相手側も粗いポリゴンを作る ▼▼▼
+                sim_b = part_b.polygon.simplify(simp_val, preserve_topology=True)
+
                 best_efficiency = -1.0
                 best_angle = 0
                 best_translated_b_poly = None
 
-                for angle in range(0, 360, self.angle_step):
-                    rotated_b = part_b.rotate_to(angle)
-                    b_coords_full = list(rotated_b.polygon.exterior.coords)
+                for angle in range(0, 360, angle_step):
+                    rotated_b = rotate(sim_b, angle, origin='centroid')
+                    b_coords_full = list(rotated_b.exterior.coords)
 
-                    # 頂点を適度に間引いて高速化
-                    step_a = max(1, len(a_rail_coords) // 25)
-                    step_b = max(1, len(b_coords_full) // 25)
-
+                    # ▼ 12や6の代わりに step_div を使う
+                    step_a = max(1, len(a_rail_coords) // step_div)
+                    step_b = max(1, len(b_coords_full) // step_div)
                     for p_a in a_rail_coords[::step_a]:
                         for p_b in b_coords_full[::step_b]:
                             dx = p_a[0] - p_b[0]
@@ -1018,26 +1103,28 @@ class PairingOptimizer:
 
                             # 1. 爆速OBB計算と【充填効率】の算出
                             translated_b_coords = [(p[0] + dx, p[1] + dy) for p in b_coords_full]
-                            combined_mp = MultiPoint(a_coords_full + translated_b_coords)
-                            comb_obb_area = combined_mp.minimum_rotated_rectangle.area
+
+                            # ▼▼▼ 修正：MultiPointをConvexHullに変換してから計算すると圧倒的に速い ▼▼▼
+                            hull = MultiPoint(a_coords_full + translated_b_coords).convex_hull
+                            comb_obb_area = hull.minimum_rotated_rectangle.area
 
                             if comb_obb_area <= 0: continue
-                            # 枠の中にどれだけギッシリ実体が詰まっているか（%）
                             efficiency = total_area / comb_obb_area
 
-                            # 過去最高でなければ重い処理をスキップ
                             if efficiency <= best_efficiency:
                                 continue
 
                             # 2. 厳密な衝突チェック（めり込み防止）
-                            translated_poly_b = translate(rotated_b.polygon, dx, dy)
+                            translated_poly_b = translate(rotated_b, dx, dy)
                             if a_collision_buf.intersects(translated_poly_b):
                                 continue
 
                             # 最高記録更新
                             best_efficiency = efficiency
                             best_angle = angle
-                            best_translated_b_poly = translated_poly_b
+                            # ▼▼▼ 修正：最終的に保存するのは「元の綺麗なポリゴン」を移動させたもの ▼▼▼
+                            original_rotated_b = rotate(part_b.polygon, angle, origin='centroid')
+                            best_translated_b_poly = translate(original_rotated_b, dx, dy)
 
                 if best_translated_b_poly is not None:
                     print(f"  [検証] {part_a.id} & {part_b.id} -> ブロック充填効率: {best_efficiency * 100:.1f}%")
@@ -1075,13 +1162,42 @@ class PairingOptimizer:
 
             poly = match['combined_poly'].simplify(0.01, preserve_topology=True)
             if poly.geom_type == 'Polygon':
-                points = list(poly.exterior.coords)[:-1]
+
+                # ▼▼▼ ここから修正：ペアを「必ず真っ直ぐ横長」に自動補正する ▼▼▼
+                rect = poly.minimum_rotated_rectangle
+                rect_coords = list(rect.exterior.coords)
+
+                # 矩形の長辺の角度を求める
+                len1 = math.hypot(rect_coords[1][0] - rect_coords[0][0], rect_coords[1][1] - rect_coords[0][1])
+                len2 = math.hypot(rect_coords[2][0] - rect_coords[1][0], rect_coords[2][1] - rect_coords[1][1])
+
+                if len1 > len2:
+                    dx = rect_coords[1][0] - rect_coords[0][0]
+                    dy = rect_coords[1][1] - rect_coords[0][1]
+                else:
+                    dx = rect_coords[2][0] - rect_coords[1][0]
+                    dy = rect_coords[2][1] - rect_coords[1][1]
+
+                # 水平（0度）に戻すための逆回転角を計算
+                align_angle = -math.degrees(math.atan2(dy, dx))
+
+                # ポリゴン全体を水平に回転させる
+                aligned_poly = rotate(poly, align_angle, origin='centroid')
+                points = list(aligned_poly.exterior.coords)[:-1]
+
                 new_part = Part(f"{pa.id}+{pb.id}", points)
                 new_part.is_merged = True
+
+                # 中の2つの部品も一緒に回転させて記憶する
+                sub1_poly = rotate(pa.polygon, align_angle, origin=poly.centroid)
+                sub2_poly = rotate(match['translated_b_poly'], align_angle, origin=poly.centroid)
+
                 new_part.sub_parts = [
-                    {"id": pa.id, "polygon": pa.polygon, "rotation": pa.rotation},
-                    {"id": pb.id, "polygon": match['translated_b_poly'], "rotation": match['best_angle']}
+                    {"id": pa.id, "polygon": sub1_poly, "rotation": (pa.rotation + align_angle) % 360},
+                    {"id": pb.id, "polygon": sub2_poly, "rotation": (match['best_angle'] + align_angle) % 360}
                 ]
+                # ▲▲▲ 修正ここまで ▲▲▲
+
                 new_parts.append(new_part)
                 used_ids.add(pa.id)
                 used_ids.add(pb.id)
@@ -1098,34 +1214,55 @@ class NestingAlgorithm:
     """ネスティングアルゴリズムのメインクラス（IFP統合版）"""
 
     # ▼▼▼ safety_margin引数を追加 ▼▼▼
-    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, safety_margin: float = 0.0, allow_rotation: bool = True, priority: str = 'none'):
+    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, safety_margin: float = 0.0, allow_rotation: bool = True, priority: str = 'none', alignment: str = 'bottom_left', accuracy: str = 'normal'):
         self.parts = parts
         self.bin_width = bin_width
         self.bin_height = bin_height
         self.safety_margin = safety_margin
-        # ▼▼▼ NFPCalculatorにマージンを渡す ▼▼▼
         self.nfp_calculator = NFPCalculator(parts, angle_step=15, margin=safety_margin)
         self.allow_rotation = allow_rotation
         self.priority = priority
+        self.alignment = alignment
+        self.accuracy = accuracy
 
     def run(self) -> ImprovedBinPacking:
         """複数の探索戦略を並列実行し、最良の結果を返す"""
         start_time = time.time()
 
-        optimizer = PairingOptimizer(self.parts, margin=self.safety_margin, angle_step=15)
+        optimizer = PairingOptimizer(self.parts, margin=self.safety_margin, accuracy=self.accuracy)
         self.parts = optimizer.find_best_pairs(threshold=0.55)
         self.nfp_calculator = NFPCalculator(self.parts, angle_step=15, margin=self.safety_margin)
         print("ステップ0: NFPの事前計算...")
         self.nfp_calculator.precompute_nfps()
 
+        if self.accuracy == 'high':
+            # 精密モード（じっくり計算）
+            pop_size = 120
+            gens = 50
+            pat = 15
+        elif self.accuracy == 'fast':
+            # 爆速モード（サクッと終わる）
+            pop_size = 40
+            gens = 10
+            pat = 3
+        else:  # 'normal'
+            # 標準モード
+            pop_size = 80
+            gens = 25
+            pat =  5
+
+            # ▼ 固定数値を上で決めた変数に差し替える
         strategies = [
-            {"name": "バランス型", "ga_params": {"population_size": 80, "generations": 5, "mutation_rate": 0.15}},
-            {"name": "広域探索型", "ga_params": {"population_size": 80, "generations": 5, "mutation_rate": 0.35}},
-            {"name": "深掘り探索型", "ga_params": {"population_size": 80, "generations": 5, "mutation_rate": 0.05}}
+            {"name": "バランス型",
+             "ga_params": {"population_size": pop_size, "generations": gens, "patience": pat, "mutation_rate": 0.15}},
+            {"name": "広域探索型",
+             "ga_params": {"population_size": pop_size, "generations": gens, "patience": pat, "mutation_rate": 0.35}},
+            {"name": "深掘り探索型",
+             "ga_params": {"population_size": pop_size, "generations": gens, "patience": pat, "mutation_rate": 0.05}}
         ]
 
-        # 並列処理の引数を準備
-        trial_args = [(self.parts, self.bin_width, self.bin_height, s, self.nfp_calculator, i + 1, self.allow_rotation, self.priority) for i, s in enumerate(strategies)]
+        trial_args = [(self.parts, self.bin_width, self.bin_height, s, self.nfp_calculator, i + 1, self.allow_rotation,
+                       self.priority, self.alignment) for i, s in enumerate(strategies)]
         # CPUのコア数（最大3）で並列実行
         num_processes = min(mp.cpu_count(), len(strategies))
         print(f"\n{num_processes}個のプロセスで並列実行を開始...")
@@ -1296,13 +1433,14 @@ def create_extended_parts() -> List[Part]:
 
 def run_single_trial(trial_args):
     """1回のネスティング試行を実行するトップレベル関数（並列処理用）"""
-    parts, bin_width, bin_height, strategy, nfp_calculator, trial_num, allow_rotation, priority = trial_args
+    # ▼ ここで確実に 9つの変数 を受け取るようにします
+    parts, bin_width, bin_height, strategy, nfp_calculator, trial_num, allow_rotation, priority, alignment = trial_args
 
     print(f"\n--- 試行 {trial_num} (戦略: {strategy['name']}) を開始 ---")
 
     if not allow_rotation:
-        ga_angle_step = 360  # 360度にすることで、0度しか選ばれなくする（実質回転なし）
-        ls_angle_range = 0  # 最後の微調整も0度にする
+        ga_angle_step = 360
+        ls_angle_range = 0
         ls_angle_step = 1
     else:
         ga_angle_step = strategy['ga_params'].get('angle_step', 15)
@@ -1312,15 +1450,17 @@ def run_single_trial(trial_args):
     params = strategy['ga_params'].copy()
     params.pop('angle_step', None)
 
-    ga = GeneticAlgorithm(parts, bin_width, bin_height, angle_step=ga_angle_step, priority=priority, **params)
+    # ▼ 1. GAに alignment=alignment を渡す！
+    ga = GeneticAlgorithm(parts, bin_width, bin_height, angle_step=ga_angle_step, priority=priority, alignment=alignment, **params)
     ga.nfp_calculator = nfp_calculator
     best_solution, _ = ga.run()
 
-    ls = LocalSearch(parts, bin_width, bin_height, angle_range=ls_angle_range, angle_step=ls_angle_step)
+    # ▼ 2. ローカル探索に alignment=alignment を渡す！
+    ls = LocalSearch(parts, bin_width, bin_height, angle_range=ls_angle_range, angle_step=ls_angle_step, alignment=alignment)
     refined_solution = ls.optimize_angles(best_solution, nfp_calculator, priority=priority)
 
-    # 3. 最終配置
-    packer = ImprovedBinPacking(bin_width, bin_height)
+    # ▼ 3. 最後の本番キャンバスにも alignment=alignment を渡す！
+    packer = ImprovedBinPacking(bin_width, bin_height, alignment=alignment)
     for part_id, angle in refined_solution:
         part = next(p for p in parts if p.id == part_id)
         rotated_part = part.rotate_to(angle)
