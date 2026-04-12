@@ -6,6 +6,7 @@ from shapely.geometry import Polygon, LineString
 from shapely.ops import unary_union
 from shapely.affinity import rotate
 from PIL import Image
+import json
 
 # ▼▼▼ 追加した魔法のコード ▼▼▼
 import multiprocessing.dummy as mp_dummy
@@ -276,16 +277,45 @@ class NestingApp(ctk.CTk):
         ctk.CTkRadioButton(self.align_subframe, text="右上", variable=self.alignment_var, value="top_right").pack(
             side="left")
 
-        ctk.CTkLabel(self.settings_frame, text="計算モード:").grid(row=5, column=0, padx=5, pady=(5, 0), sticky="e")
+        ctk.CTkLabel(self.settings_frame, text="計算モード:").grid(row=5, column=0, padx=5, pady=(5, 0), sticky="ne")
         self.accuracy_var = ctk.StringVar(value="normal")
         self.acc_subframe = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
         self.acc_subframe.grid(row=5, column=1, columnspan=3, sticky="w", pady=(5, 0))
-        ctk.CTkRadioButton(self.acc_subframe, text="精密 (時間大)", variable=self.accuracy_var, value="high").pack(
-            side="left", padx=(0, 10))
-        ctk.CTkRadioButton(self.acc_subframe, text="標準 (おすすめ)", variable=self.accuracy_var, value="normal").pack(
-            side="left", padx=(0, 10))
-        ctk.CTkRadioButton(self.acc_subframe, text="爆速 (粗め)", variable=self.accuracy_var, value="fast").pack(
-            side="left")
+
+        # --- 1段目 ---
+        ctk.CTkRadioButton(self.acc_subframe, text="精密", variable=self.accuracy_var, value="high").grid(row=0,
+                                                                                                          column=0,
+                                                                                                          padx=(0, 10),
+                                                                                                          pady=2,
+                                                                                                          sticky="w")
+        ctk.CTkRadioButton(self.acc_subframe, text="標準", variable=self.accuracy_var, value="normal").grid(row=0,
+                                                                                                            column=1,
+                                                                                                            padx=(0,
+                                                                                                                  10),
+                                                                                                            pady=2,
+                                                                                                            sticky="w")
+        ctk.CTkRadioButton(self.acc_subframe, text="速さ", variable=self.accuracy_var, value="fast").grid(row=0,
+                                                                                                          column=2,
+                                                                                                          padx=(0, 10),
+                                                                                                          pady=2,
+                                                                                                          sticky="w")
+
+        # --- 2段目 ---
+        ctk.CTkRadioButton(self.acc_subframe, text="合体オフ(非推奨)", variable=self.accuracy_var, value="none").grid(
+            row=1, column=0, padx=(0, 10), pady=(5, 2), sticky="w")
+        ctk.CTkRadioButton(self.acc_subframe, text="カスタム", variable=self.accuracy_var, value="custom").grid(row=1,
+                                                                                                                column=1,
+                                                                                                                padx=(0,
+                                                                                                                      5),
+                                                                                                                pady=(5,
+                                                                                                                      2),
+                                                                                                                sticky="w")
+
+        self.custom_btn = ctk.CTkButton(self.acc_subframe, text="⚙️", width=30, command=self.open_custom_settings)
+        self.custom_btn.grid(row=1, column=2, pady=(5, 2), sticky="w")
+
+        # カスタム設定の読み込み
+        self.custom_config = self.load_custom_config()
 
 
         self.run_btn = ctk.CTkButton(self.left_panel, text="▶ 保存先を決めて実行", command=self.start_nesting,
@@ -363,17 +393,28 @@ class NestingApp(ctk.CTk):
         filepaths = filedialog.askopenfilenames(initialdir=initial_dir, filetypes=[("DXF Files", "*.dxf")])
 
         if filepaths:
-            for widget in self.file_list_frame.winfo_children():
-                widget.destroy()
-            self.file_entries.clear()
-
+            # ▼ 毎回クリアせず、新しく選んだファイルだけを「追加」する
             for filepath in filepaths:
+                if filepath in self.file_entries:
+                    continue  # 既に追加されているファイルは無視
+
                 filename = os.path.basename(filepath)
                 row_frame = ctk.CTkFrame(self.file_list_frame, fg_color="transparent")
                 row_frame.pack(fill="x", pady=2)
 
                 lbl = ctk.CTkLabel(row_frame, text=filename, width=150, anchor="w")
                 lbl.pack(side="left", padx=5)
+
+                # ▼▼▼ 新規追加: 個別削除ボタンの機能 ▼▼▼
+                def delete_file(fp=filepath, row=row_frame):
+                    row.destroy()
+                    if fp in self.file_entries:
+                        del self.file_entries[fp]
+
+                del_btn = ctk.CTkButton(row_frame, text="×", width=25, height=25, fg_color="#dc3545",
+                                        hover_color="#c82333", command=delete_file)
+                del_btn.pack(side="right", padx=5)
+                # ▲▲▲
 
                 qty_entry = ctk.CTkEntry(row_frame, width=40)
                 qty_entry.insert(0, "1")
@@ -382,7 +423,64 @@ class NestingApp(ctk.CTk):
                 ctk.CTkLabel(row_frame, text="個数:").pack(side="right")
                 self.file_entries[filepath] = qty_entry
 
-            print(f"{len(filepaths)} 件のファイルがセットされました。")
+            print(f"ファイルリストを更新しました。現在 {len(self.file_entries)} 件セットされています。")
+
+    # ▼▼▼ 新規追加: カスタムパラメータの保存と読み込み ▼▼▼
+    def load_custom_config(self):
+        import json
+        try:
+            with open('nesting_custom_config.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            # ファイルが無い場合（初回起動時）の初期値
+            return {
+                "simp_val": 1.0, "step_div": 8, "angle_step": 15,
+                "pop_size": 60, "gens": 20, "patience": 10
+            }
+
+    def open_custom_settings(self):
+        top = ctk.CTkToplevel(self)
+        top.title("カスタムパラメータ設定")
+        top.geometry("340x380")
+        top.transient(self)
+
+        entries = {}
+        labels = {
+            "simp_val": "輪郭の粗さ (例:1.0~5.0):",
+            "step_div": "衝突判定の間引き (例:4~12):",
+            "angle_step": "回転角度の刻み (例:15~90):",
+            "pop_size": "GA 個体数 (例:40~120):",
+            "gens": "GA 最大世代数 (例:10~50):",
+            "patience": "GA 諦める世代数 (例:3~15):"
+        }
+
+        row = 0
+        for key, label_text in labels.items():
+            ctk.CTkLabel(top, text=label_text).grid(row=row, column=0, padx=10, pady=10, sticky="e")
+            e = ctk.CTkEntry(top, width=80)
+            e.insert(0, str(self.custom_config.get(key, "")))
+            e.grid(row=row, column=1, padx=10, pady=10)
+            entries[key] = e
+            row += 1
+
+        def save_and_close():
+            import json
+            try:
+                for key in entries:
+                    # simp_valは小数、それ以外は整数として保存
+                    self.custom_config[key] = float(entries[key].get()) if "simp" in key else int(entries[key].get())
+                with open('nesting_custom_config.json', 'w', encoding='utf-8') as f:
+                    json.dump(self.custom_config, f)
+                self.accuracy_var.set("custom")  # 自動でカスタムモードを選択状態にする
+                top.destroy()
+            except ValueError:
+                messagebox.showerror("エラー", "数値を正しく入力してください", parent=top)
+
+        ctk.CTkButton(top, text="保存して閉じる", command=save_and_close).grid(row=row, column=0, columnspan=2, pady=20)
+
+
+
+
 
     def start_nesting(self):
         if not self.file_entries:
@@ -434,14 +532,15 @@ class NestingApp(ctk.CTk):
         priority_val = self.priority_var.get()
         alignment_val = self.alignment_var.get()
         accuracy_val = self.accuracy_var.get()
+        custom_config = self.custom_config
 
         threading.Thread(target=self.run_nesting_logic,
                          args=(file_quantities, sheet_w, sheet_h, margin, allow_rot, priority_val, alignment_val,
-                               accuracy_val, save_path),
+                               accuracy_val, custom_config, save_path),
                          daemon=True).start()
 
-    def run_nesting_logic(self, file_quantities, sheet_width, sheet_height, margin, allow_rotation, priority, alignment,
-                          accuracy, save_path):
+    def run_nesting_logic(self, file_quantities, sheet_width, sheet_height, margin, allow_rotation, priority, alignment, accuracy,
+                          custom_config, save_path):
 
         try:
             parts = []
@@ -472,10 +571,9 @@ class NestingApp(ctk.CTk):
             # ... (中略) ...
             print(f"2. パズルの最適解を計算中... (優先モード: {priority} / 配置基準: {alignment})")
 
-            # ▼ 最後に alignment=alignment を追加！
             nester = NestingAlgorithm(parts, sheet_width, sheet_height, safety_margin=margin,
                                       allow_rotation=allow_rotation, priority=priority, alignment=alignment,
-                                      accuracy=accuracy)
+                                      accuracy=accuracy, custom_config=custom_config)
             result_packer, _ = nester.run()
 
             # ▼▼▼ AIの計算が終わった後、DXF出力の直前にキャンバスを反転させる ▼▼▼

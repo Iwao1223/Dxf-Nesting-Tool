@@ -370,13 +370,17 @@ class ImprovedBinPacking:
                         break
 
                 if not collision:
+                    # ▼ 修正2: パーツの「足元(pos[1])」ではなく「頭頂部(test_bounds[3])」を最小化する！
                     if priority == 'height':
-                        metric = pos[0] ** 2 + (pos[1] * 1.5) ** 2
+                        # パーツの一番高いところ(max_y)を極限まで低くし、次に左詰めにする
+                        base_metric = (test_bounds[3] * 1000) + test_bounds[0]
                     elif priority == 'width':
-                        metric = (pos[0] * 1.5) ** 2 + pos[1] ** 2
+                        # パーツの一番右端(max_x)を極限まで左にし、次に下詰めにする
+                        base_metric = (test_bounds[2] * 1000) + test_bounds[1]
                     else:
-                        metric = pos[0] ** 2 + pos[1] ** 2
+                        base_metric = (test_bounds[3] * 100) + test_bounds[2]
 
+                    metric = base_metric
                     valid_positions.append((pos, metric))
             except Exception as e:
                 print(f"候補位置検証エラー: {e}")
@@ -702,24 +706,51 @@ class GeneticAlgorithm:
         self.alignment = alignment
         self.patience = patience
         self.nfp_calculator = None
-        
+
     def initialize_population(self) -> List[List[Tuple[str, float]]]:
-        """初期集団をランダムに生成"""
+        """初期集団を生成（ランダム ＋ 最強のシード個体を注入）"""
         population = []
-        
-        for _ in range(self.population_size):
-            # 部品IDと角度のリストをランダム化
+
+        # ▼▼▼ 究極の改善：AIに「人間的で一番綺麗な置き方」を1つだけ教え込む ▼▼▼
+        # 1. 面積が大きいパーツから順番に並べる（大きいものから置くのが鉄則）
+        sorted_parts = sorted(self.parts, key=lambda p: p.get_area(), reverse=True)
+        smart_individual = []
+
+        for p in sorted_parts:
+            # 2. 0, 90, 180, 270度のうち、一番「高さ(Y)が低く平べったくなる角度」を探す
+            best_init_angle = 0
+            min_h = float('inf')
+
+            # 回転が許可されている場合のみ4方向をテスト、ダメなら0度
+            test_angles = [0, 90, 180, 270] if self.angle_step < 360 else [0]
+
+            for test_angle in test_angles:
+                rotated = p.rotate_to(test_angle)
+                bounds = rotated.get_bounds()
+                h = bounds[3] - bounds[1]  # 高さを計算
+                if h < min_h:
+                    min_h = h
+                    best_init_angle = test_angle
+
+            smart_individual.append((p.id, best_init_angle))
+
+        # この「最強のシード個体」を第1号としてエントリーさせる！
+        population.append(smart_individual)
+        # ▲▲▲ 改善ここまで ▲▲▲
+
+        # 残りの個体は、今まで通り「完全ランダム」で生成して多様性を確保する
+        # （population_size - 1 回ループする）
+        for _ in range(self.population_size - 1):
             individual = []
             parts_ids = [part.id for part in self.parts]
             random.shuffle(parts_ids)
-            
+
             for part_id in parts_ids:
-                # ランダムな回転角度（angle_stepの倍数）
                 angle = random.randrange(0, 360, self.angle_step)
                 individual.append((part_id, angle))
-                
+
             population.append(individual)
-            
+
         return population
 
     def evaluate_individual(self, individual: List[Tuple[str, float]]) -> float:
@@ -737,17 +768,20 @@ class GeneticAlgorithm:
         bin_height = bin_packer.get_bin_height()
         bin_width_used = bin_packer.get_bin_width_used()
 
-        # ▼▼▼ 面積を基本としつつ、優先したい辺に1.1乗の緩いペナルティをかける ▼▼▼
-        if self.priority == 'height':
-            score = bin_width_used * (bin_height ** 1.1)
-        elif self.priority == 'width':
-            score = (bin_width_used ** 1.1) * bin_height
-        else:
-            score = bin_width_used * bin_height
+        overflow_x = max(0, bin_width_used - self.bin_width)
+        overflow_y = max(0, bin_height - self.bin_height)
 
-            # ▼▼▼ 新規追加：枠からはみ出たら「1000万点」のペナルティを与えて絶対に選ばれないようにする ▼▼▼
-        if bin_height > self.bin_height or bin_width_used > self.bin_width:
-            score += 10000000
+        # ▼▼▼ こちらも「高さ最小化」に変更する ▼▼▼
+        if self.priority == 'height':
+            score = bin_height
+        elif self.priority == 'width':
+            score = bin_width_used
+        else:
+            score = bin_height + (bin_width_used * 0.01)
+
+        # ▼▼▼ こちらも同じくペナルティを適用 ▼▼▼
+        if overflow_y > 0 or overflow_x > 0:
+            score += 1000000 * overflow_x + 100000000 * overflow_y
 
         return 1.0 / (score + 1)
         
@@ -993,16 +1027,23 @@ class LocalSearch:
         bin_height = bin_packer.get_bin_height()
         bin_width_used = bin_packer.get_bin_width_used()
 
-        if priority == 'height':
-            score = bin_width_used * (bin_height ** 1.1)
-        elif priority == 'width':
-            score = (bin_width_used ** 1.1) * bin_height
-        else:
-            score = bin_width_used * bin_height
+        overflow_x = max(0, bin_width_used - self.bin_width)
+        overflow_y = max(0, bin_height - self.bin_height)
 
-            # ▼▼▼ 新規追加：ローカル探索でもはみ出しは絶対に許さない ▼▼▼
-        if bin_height > self.bin_height or bin_width_used > self.bin_width:
-            score += 10000000
+
+        if priority == 'height':
+            # 高さを極限まで低くする
+            score = bin_height
+        elif priority == 'width':
+            # 幅を極限まで狭くする
+            score = bin_width_used
+        else:
+            # 標準: 基本は高さを低くしつつ、同じ高さなら幅も詰める（高さ優先）
+            score = bin_height + (bin_width_used * 0.01)
+
+        # ▼▼▼ 天井(Y軸)を突き破った場合は、横(X軸)の100倍のペナルティ ▼▼▼
+        if overflow_y > 0 or overflow_x > 0:
+            score += 1000000 * overflow_x + 100000000 * overflow_y
 
         return score
 
@@ -1026,26 +1067,26 @@ def calculate_nfp_task(task, parts_dict):
 class PairingOptimizer:
     """事前合体（ペアリング）を行うクラス（究極版：真の「ブロック充填効率」ベース）"""
 
-    def __init__(self, parts: List[Part], margin: float = 0.0, accuracy: str = 'normal'):
+    def __init__(self, parts: List[Part], margin: float = 0.0, accuracy: str = 'normal', custom_config: dict = None):
         self.parts = parts
         self.margin = margin
         self.accuracy = accuracy
+        self.custom_config = custom_config
 
     def find_best_pairs(self, threshold: float = 0.55) -> List[Part]:
         from shapely.geometry import MultiPoint
 
         if self.accuracy == 'high':
-            simp_val = 1.0  # 頂点を細かく残す
-            step_div = 12  # 衝突判定の点数（多め）
-            angle_step = 15  # 回転の刻み（細かい）
+            simp_val, step_div, angle_step = 1.0, 12, 15
         elif self.accuracy == 'fast':
-            simp_val = 4.0  # 大雑把な図形にする
-            step_div = 4  # 衝突判定の点数（少ない）
-            angle_step = 45  # 回転の刻み（粗い）
+            simp_val, step_div, angle_step = 4.0, 4, 45
+        elif self.accuracy == 'custom' and self.custom_config:
+            # GUIから受け取った設定を使う
+            simp_val = self.custom_config['simp_val']
+            step_div = self.custom_config['step_div']
+            angle_step = self.custom_config['angle_step']
         else:  # 'normal'
-            simp_val = 2.0
-            step_div = 8
-            angle_step = 30
+            simp_val, step_div, angle_step = 2.0, 8, 30
 
         print("\n" + "=" * 15 + f" 自動ペアリング（モード: {self.accuracy}）を開始 " + "=" * 15)
         n_parts = len(self.parts)
@@ -1214,7 +1255,8 @@ class NestingAlgorithm:
     """ネスティングアルゴリズムのメインクラス（IFP統合版）"""
 
     # ▼▼▼ safety_margin引数を追加 ▼▼▼
-    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, safety_margin: float = 0.0, allow_rotation: bool = True, priority: str = 'none', alignment: str = 'bottom_left', accuracy: str = 'normal'):
+    def __init__(self, parts: List[Part], bin_width: float, bin_height: float, safety_margin: float = 0.0, allow_rotation: bool = True, priority: str = 'none',
+                 alignment: str = 'bottom_left', accuracy: str = 'normal', custom_config: dict = None):
         self.parts = parts
         self.bin_width = bin_width
         self.bin_height = bin_height
@@ -1223,34 +1265,40 @@ class NestingAlgorithm:
         self.allow_rotation = allow_rotation
         self.priority = priority
         self.alignment = alignment
+        self.custom_config = custom_config
         self.accuracy = accuracy
 
     def run(self) -> ImprovedBinPacking:
         """複数の探索戦略を並列実行し、最良の結果を返す"""
         start_time = time.time()
 
-        optimizer = PairingOptimizer(self.parts, margin=self.safety_margin, accuracy=self.accuracy)
-        self.parts = optimizer.find_best_pairs(threshold=0.55)
+        if self.accuracy != 'none':
+            # ↓ 'none' 以外なら呼び出す
+            optimizer = PairingOptimizer(self.parts, margin=self.safety_margin, accuracy=self.accuracy,
+                                         custom_config=self.custom_config)
+            self.parts = optimizer.find_best_pairs(threshold=0.55)
+        else:
+            print("事前合体(ペアリング)はオフに設定されています。単独で配置します。")
         self.nfp_calculator = NFPCalculator(self.parts, angle_step=15, margin=self.safety_margin)
         print("ステップ0: NFPの事前計算...")
         self.nfp_calculator.precompute_nfps()
 
+        # ▼▼▼ カスタムモードの適用 (GA側) ▼▼▼
         if self.accuracy == 'high':
-            # 精密モード（じっくり計算）
-            pop_size = 120
-            gens = 50
-            pat = 15
+            pop_size, gens, pat = 120, 50, 15
         elif self.accuracy == 'fast':
-            # 爆速モード（サクッと終わる）
-            pop_size = 40
-            gens = 10
-            pat = 3
+            pop_size, gens, pat = 40, 10, 3
+        elif self.accuracy == 'custom' and self.custom_config:
+            # GUIから受け取った設定を使う
+            pop_size = self.custom_config['pop_size']
+            gens = self.custom_config['gens']
+            pat = self.custom_config['patience']
+        elif self.accuracy == 'none':  # ← ★ 新規追加！
+            # 合体なしの場合は、標準的なパラメータで探索する
+            # （もし合体なしの時だけもっと探索を軽く/重くしたい場合は、ここをいじれます）
+            pop_size, gens, pat = 80, 25, 5
         else:  # 'normal'
-            # 標準モード
-            pop_size = 80
-            gens = 25
-            pat =  5
-
+            pop_size, gens, pat = 80, 25, 5
             # ▼ 固定数値を上で決めた変数に差し替える
         strategies = [
             {"name": "バランス型",
