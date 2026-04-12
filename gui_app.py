@@ -512,7 +512,7 @@ class NestingApp(ctk.CTk):
         save_path = filedialog.asksaveasfilename(
             title="結果の保存先を指定してください",
             initialdir=initial_dir,
-            initialfile="ネスティング結果.dxf",
+            initialfile="nesting_result.dxf",
             defaultextension=".dxf",
             filetypes=[("DXF Files", "*.dxf")]
         )

@@ -394,18 +394,12 @@ class ImprovedBinPacking:
             return min(valid_positions, key=lambda x: x[1])[0]
 
         if not valid_positions:
-            # 配置エラー時は重ならないように枠外へ退避
-            part_h = part.get_bounds()[3] - part.get_bounds()[1]
-            if self.alignment in ['top_left', 'top_right']:
-                min_height = self.bin_height
-                if self.placed_parts:
-                    min_height = min(p.get_bounds()[1] for p in self.placed_parts)
-                return (0, min_height - margin - part_h)
-            else:
-                max_height = 0
-                if self.placed_parts:
-                    max_height = max(p.get_bounds()[3] for p in self.placed_parts)
-                return (0, max_height + margin)
+            # 配置エラー時は重ならないように枠外（一番上）へ退避
+            # ▼ ここも左上ルールを削除してシンプルにする
+            max_height = 0
+            if self.placed_parts:
+                max_height = max(p.get_bounds()[3] for p in self.placed_parts)
+            return (0, max_height + margin)
 
         return min(valid_positions, key=lambda x: x[1])[0]
         # """最適配置位置を見つける（IFP候補生成 + NFP衝突判定による最終版）""""""NFPを使用して最適配置位置を見つける（基準点問題を修正した最終版）"""
@@ -468,19 +462,13 @@ class ImprovedBinPacking:
 
     def get_bin_height(self) -> float:
         if not self.placed_parts: return 0
-        if self.alignment in ['top_left', 'top_right']:
-            min_y = min(p.get_bounds()[1] for p in self.placed_parts)
-            return self.bin_height - min_y
-        else:
-            return max(p.get_bounds()[3] for p in self.placed_parts)
+        # ▼ AIは常に左下基準(Y=0)で計算するため、単純に一番高いY座標を返すだけでOK！
+        return max(p.get_bounds()[3] for p in self.placed_parts)
 
     def get_bin_width_used(self) -> float:
         if not self.placed_parts: return 0
-        if self.alignment in ['bottom_right', 'top_right']:
-            min_x = min(p.get_bounds()[0] for p in self.placed_parts)
-            return self.bin_width - min_x
-        else:
-            return max(p.get_bounds()[2] for p in self.placed_parts)
+        # ▼ 同じく、一番右のX座標を返すだけ！
+        return max(p.get_bounds()[2] for p in self.placed_parts)
 
     def get_utilization(self) -> float:
         total_area = sum(part.get_area() for part in self.placed_parts)
@@ -533,7 +521,8 @@ class ImprovedBinPacking:
 
             x, y = zip(*points_to_draw)
 
-            ax.fill(x, y, alpha=0.8, color=colors[i % 20], label=f"Part {part.id} ({part.rotation}°)")
+            # ▼ 角度の表示をスッキリさせる (例: 180.0°)
+            ax.fill(x, y, alpha=0.8, color=colors[i % 20], label=f"{part.id} ({part.rotation:.1f}°)")
 
             try:
                 rep_point = part.polygon.representative_point()
@@ -555,9 +544,14 @@ class ImprovedBinPacking:
         else:
             ax.set_title(f'ネスティング結果 (利用率: {self.get_utilization():.2%})')
 
-        ax.legend(loc='upper right')
+        # ▼ 凡例を小さく、半透明(0.5)にし、列を3つに分けて高さを抑える
+        # ▼ 凡例をグラフの「外側（左下）」に完全に追い出す！
+        # ncol=3〜4くらいにして横長に広げると、下のスペースに綺麗に収まります。
+        ax.legend(bbox_to_anchor=(0, -0.1), loc='upper left', borderaxespad=0, fontsize='x-small', ncol=4)
         ax.grid(True, linestyle='--', alpha=0.3)  # グリッドを少し薄く
 
+        # ▼ 凡例を外に出した分、画像やGUIの下部が見切れないようにレイアウトを自動調整する
+        fig.tight_layout()
         if save_path:
             plt.savefig(save_path, bbox_inches='tight')
 
